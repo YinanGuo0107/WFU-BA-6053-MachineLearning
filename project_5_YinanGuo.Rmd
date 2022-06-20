@@ -1,0 +1,354 @@
+---
+title: "Project 5"
+output: html_notebook
+---
+
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+
+library(vip)
+library(parallel)
+library(doParallel)
+library(embed)
+library(textrecipes)
+```
+
+# import training & holdout 
+```{r}
+
+digit_train <- read_csv("digit_train.csv") %>%
+  clean_names() %>%
+  mutate(label = factor(label))
+
+
+
+digit_holdout <- read_csv("digit_holdout.csv") %>%
+  clean_names() 
+ 
+digit_holdout_scaled <- digit_holdout %>%
+  mutate_if(is.numeric, funs(./255)) 
+digit_train_scaled <- digit_train %>%
+  mutate_if(is.numeric, funs(./255)) 
+
+head(digit_train_scaled)
+```
+
+# define train/test split 
+```{r}
+set.seed(42)
+train_test_spit<- initial_split(digit_train_scaled, prop = 0.7)
+
+train <- training(train_test_spit)
+test  <- testing(train_test_spit)
+
+# -- we need to scale the data outside of the recipe 
+digit_train_scaled <- train %>%
+   mutate_if(is.numeric, funs(./255))  #-- this is going to normalize your data for you
+ 
+# -- we need to scale the data outside of the recipe 
+digit_test_scaled <- test %>%
+   mutate_if(is.numeric, funs(./255))  #-- this is going to normalize your data for you
+
+
+train_cv_folds <- vfold_cv(digit_train_scaled, v=5)
+
+```
+
+# define recipe 
+```{r}
+digit_recipe <- recipe(label ~ ., digit_train_scaled) %>%
+  update_role(id, new_role = "ignore") 
+```
+
+# Nueral Network
+## tune grid
+```{r}
+digit_mlp <- mlp(
+  hidden_units = tune(),
+  penalty = tune()
+) %>%
+  set_engine("nnet", MaxNWts=10245) %>%
+  set_mode("classification")
+
+digit_workflow <- workflow() %>%
+  add_recipe(digit_recipe) %>%
+  add_model(digit_mlp) 
+
+tune_grid_mlp <- grid_random(hidden_units(c(5,15)),
+                         penalty(),
+                          size = 5)
+print(tune_grid_mlp)
+# -- setup parallel process 
+all_cores <- detectCores(logical = TRUE)
+sprintf("# of Logical Cores: %d", all_cores)
+cl <- makeCluster(all_cores)
+registerDoParallel(cl)
+# -- train!! K times for each parameter -- 
+mlp_tuning_result <- digit_workflow %>% 
+  tune_grid(
+    resamples = train_cv_folds,
+    grid = tune_grid_mlp,
+    control = control_grid(save_pred = TRUE,verbose = TRUE, allow_par = TRUE,parallel_over = "everything")
+    )
+
+mlp_tuning_result
+```
+## show tuning results
+```{r}
+mlp_tuning_result %>% 
+  collect_metrics() %>%
+  mutate_if(is.numeric, round,3) %>% 
+  pivot_wider(names_from = .metric, values_from=c(mean, std_err))
+```
+## result
+```{r}
+mlp_best <- mlp_tuning_result %>%
+  select_best("accuracy") 
+
+print(mlp_best)
+```
+## refitting workflow with "best" parameters
+```{r}
+mlp_final_wf <- digit_workflow %>% 
+  finalize_workflow(mlp_best)
+
+print(mlp_final_wf)
+
+mlp_final_fit  <- mlp_final_wf %>%
+  fit(data = train) 
+```
+## score
+```{r}
+options(yardstick.event_first = FALSE)
+predict(mlp_final_fit, train,type="class") %>%
+    bind_cols(., train )-> scored_train_mlp
+    
+predict(mlp_final_fit, test,type="class") %>%
+    bind_cols(., test )-> scored_test_mlp
+
+predict(rf_final_fit, digit_holdout_scaled,type="class") %>%
+    bind_cols(., digit_holdout )-> scored_holdout
+
+scored_rftrain %>%
+  mutate(.part = "train") %>%
+  bind_rows(scored_rftest %>%
+              mutate(.part = "test")
+  ) %>%
+  group_by(.part) %>%
+    metrics(label, estimate = .pred_class) %>%
+  filter(.metric == "accuracy") %>%
+  spread(.metric, .estimate) %>%
+  select(-.estimator)
+
+```
+
+# Random Forest
+## tune
+```{r}
+
+# -- setup model spec w. tuning 
+rf_model <- rand_forest(
+    trees  = tune(),
+    min_n = 3,
+   ) %>% 
+      set_engine("ranger", importance = "impurity") %>% 
+      set_mode("classification")
+
+# -- setup workflow 
+rf_workflow <- workflow() %>%
+  add_recipe(digit_recipe) %>%
+  add_model(rf_model) 
+
+
+# -- setup your tuning grid -- random force 
+tune_grid <- grid_random(trees(c(200,600)),
+                          size = 5)
+print(tune_grid)
+
+# -- setup parallel process 
+all_cores <- detectCores(logical = TRUE)
+sprintf("# of Logical Cores: %d", all_cores)
+cl <- makeCluster(all_cores)
+registerDoParallel(cl)
+
+# -- train!! K times for each parameter -- 
+rf_tuning_results <- rf_workflow %>% 
+  tune_grid(
+    resamples = train_cv_folds,
+    grid = tune_grid,
+    control = control_resamples(save_pred = TRUE)
+    )
+
+rf_tuning_results
+
+```
+## Review Tuning Results 
+```{r}
+## -- results of tuning -- 
+
+rf_tuning_results %>% 
+  collect_metrics() %>%
+  mutate_if(is.numeric, round,3) %>% 
+  pivot_wider(names_from = .metric, values_from=c(mean, std_err))
+```
+## results 
+```{r}
+rf_best <- rf_tuning_results %>%
+  select_best("accuracy") 
+
+print(rf_best)
+```
+## refitting workflow with "best" parameters
+```{r}
+rf_final_wf <- rf_workflow %>% 
+  finalize_workflow(rf_best)
+
+print(rf_final_wf)
+
+rf_final_fit  <- rf_final_wf %>%
+  fit(data = train) 
+```
+## score
+```{r}
+options(yardstick.event_first = FALSE)
+predict(rf_final_fit, train,type="class") %>%
+    bind_cols(., train )-> scored_rftrain
+    
+predict(rf_final_fit, test,type="class") %>%
+    bind_cols(., test )-> scored_rftest
+
+predict(rf_final_fit, digit_holdout_scaled,type="class") %>%
+    bind_cols(., digit_holdout )-> scored_holdout
+
+scored_rftrain %>%
+  mutate(.part = "train") %>%
+  bind_rows(scored_rftest %>%
+              mutate(.part = "test")
+  ) %>%
+  group_by(.part) %>%
+    metrics(label, estimate = .pred_class) %>%
+  filter(.metric == "accuracy") %>%
+  spread(.metric, .estimate) %>%
+  select(-.estimator)
+
+
+```
+
+# XGB model
+## tune grid
+```{r}
+xgb_model <- boost_tree(
+    trees = 200,
+  min_n = tune()            ## minimum number of observations 
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_model
+
+# -- setup workflow 
+xgb_workflow <- workflow() %>%
+  add_recipe(digit_recipe) %>%
+  add_model(xgb_model) 
+
+
+# -- setup your tuning grid -- random force 
+tune_grid <- grid_random(min_n(c(2,10)),
+                          size = 5)
+print(tune_grid)
+```
+## Review Tuning Results 
+```{r}
+ xgb_tuning_results <- xgb_workflow %>% 
+   tune_grid(
+     resamples = train_cv_folds,
+     grid = tune_grid,
+     control = control_grid(save_pred = TRUE,verbose = TRUE, allow_par = TRUE,parallel_over = "everything")
+     )
+ 
+ xgb_tuning_results
+
+## -- results of tuning -- 
+ xgb_tuning_results %>% 
+   collect_metrics() %>%
+   mutate_if(is.numeric, round,3) %>% 
+   pivot_wider(names_from = .metric, values_from=c(mean, std_err))
+```
+## selecting "best" parameters 
+```{r}
+xgb_tuning_results %>%
+  show_best("roc_auc") %>%
+  print()
+
+xgb_best <- xgb_tuning_results %>%
+  select_best("roc_auc") 
+
+print(xgb_best)
+```
+## refitting workflow with "best" parameters
+```{r}
+
+xgb_final_wf <- xgb_workflow %>% 
+  finalize_workflow(xgb_best)
+
+print(xgb_final_wf)
+
+xgb_final_fit  <- xgb_final_wf %>%
+  fit(data = train) 
+```
+## score
+```{r}
+
+predict(xgb_final_fit  , train, type="class") %>%
+  bind_cols(.,train) -> scored_train_xgb
+
+predict(xgb_final_fit , test, type="class") %>%
+  bind_cols(test)->scored_test_xgb
+
+ predict(xgb_final_fit, digit_holdout_scaled,type="class") %>%
+    bind_cols(., digit_holdout )-> scored_holdout1
+ 
+ scored_train_xgb %>%
+  mutate(.part = "train") %>%
+  bind_rows(scored_test_xgb %>%
+              mutate(.part = "test")
+  ) %>%
+  group_by(.part) %>%
+    metrics(label, estimate = .pred_class) %>%
+  filter(.metric == "accuracy") %>%
+  spread(.metric, .estimate) %>%
+  select(-.estimator)
+  
+```
+# visualize differences 
+```{r}
+plot <- function(scored) {
+viz<-scored %>%
+  filter(label != .pred_class) %>%
+  select(starts_with("x"), label,.pred_class ) %>%
+  head(12) %>%
+  mutate(instance = row_number()) %>%
+  gather(pixel, value, -label, -instance, -.pred_class) %>%
+  tidyr::extract(pixel, "pixel", "(\\d+)", convert = TRUE) %>%
+  mutate(pixel = pixel - 2,
+         x = pixel %% 28,
+         y = 28 - pixel %/% 28)
+  
+  theme_set(theme_light())
+  
+viz %>%
+  ggplot(aes(x, y, fill = value)) +
+  geom_tile() +
+  facet_wrap(~ label + .pred_class)
+}
+
+
+
+plot(scored_test_mlp)
+plot(scored_rftest)
+plot(scored_test_xgb)
+```
