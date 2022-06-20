@@ -1,0 +1,497 @@
+---
+title: "Churn prediction by Yinan Guo"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(kableExtra)
+library(GGally)
+library(vip) 
+library(fastshap) 
+library(rpart.plot) 
+library(MASS)
+library(caret)
+library(rpart)
+library(glmnet)
+library(reshape2)
+```
+
+# Import training data set
+```{r}
+churn <- read_csv("Churn_training.csv") %>% clean_names()
+head(churn)
+```
+
+# Explore data
+## skim
+```{r}
+churn%>%skim_without_charts()
+```
+
+## Make factors
+```{r}
+churn <- churn %>%
+  mutate(churn =as_factor(churn))%>%
+  mutate_if(is.character,as_factor)
+```
+
+## Explore target
+```{r}
+churn %>%
+  count(churn) %>%
+  mutate(pct = n/sum(n)) -> churn_rate
+
+churn_rate %>%
+  ggplot(aes(x=churn, y=pct)) +
+  geom_col() +
+  geom_text(aes(label=pct) ,color="red") + 
+  labs(title="Churn Rate")
+```
+
+## Explore numerics
+```{r}
+# Explore numeric
+ggplot(churn, aes(x=monthly_minutes,y=churn,group=churn)) + geom_boxplot() +labs(title = "Monthly minutes ")
+ggplot(churn, aes(x=customer_service_calls,y=churn,group=churn)) + geom_boxplot() +labs(title = "Customer Service Calls")
+ggplot(churn, aes(x=streaming_minutes,y=churn,group=churn)) + geom_boxplot() +labs(title = "Streaming Munites")
+ggplot(churn, aes(x=total_billed,y=churn,group=churn)) + geom_boxplot() +labs(title = "Total billed")
+ggplot(churn, aes(x=prev_balance,y=churn,group=churn)) + geom_boxplot() +labs(title = "Prev Balance")
+ggplot(churn, aes(x=late_payments,y=churn,group=churn)) + geom_boxplot() +labs(title = "Late Payments")
+ggplot(churn, aes(x=phone_area_code,y=churn,group=churn)) + geom_boxplot() +labs(title = "Phone Area Code")
+ggplot(churn, aes(x=number_phones,y=churn,group=churn)) + geom_boxplot() +labs(title = "Number Phones")
+
+```
+
+## Explore characters
+### barplot
+```{r}
+bar_plot <- function(a,colname){
+    churn %>%
+    ggplot(., aes(a)) + 
+    geom_bar(aes(fill = churn), position = "fill") +
+    labs(title = paste("Barplot for",colname), x = colname, y="percent")+
+    geom_hline(yintercept = 0.05)+
+    theme(axis.text.x = element_text(angle = 90, hjust = 0.5, vjust = 0.5))
+}
+bar_plot(churn$email_domain,"Email Domain")
+bar_plot(churn$phone_model,"Phone Model")
+bar_plot(churn$partner,"Partner")
+bar_plot(churn$phone_service,"Phone Service")
+bar_plot(churn$streaming_plan,"Streaming Plan")
+bar_plot(churn$multiple_lines,"Multiple Lines")
+bar_plot(churn$mobile_hotspot,"Mobile Hotspot")
+bar_plot(churn$wifi_calling_text,"Wifi Calling Text")
+bar_plot(churn$online_backup,"Online Backup")
+bar_plot(churn$device_protection,"device_protection")
+bar_plot(churn$contract_code,"Contract Code")
+bar_plot(churn$currency_code,"Currency Code")
+bar_plot(churn$maling_code,"Maling Code")
+bar_plot(churn$paperless_billing,"Paperless Billing")
+bar_plot(churn$payment_method,"Payment Method")
+bar_plot(churn$gender,"Gender")
+bar_plot(churn$network_speed,"Network Speed")
+```
+
+### chart
+```{r}
+category_eval <- function(col){
+  
+churn%>% 
+  group_by(churn) %>%
+  count(!!as.name(col)) %>%
+  pivot_wider(values_from=c(n), names_from = churn) %>%
+      mutate(pct_1 = `1`/ (`0` + `1`),
+             pct_0 = 1 - pct_1) %>%
+    arrange(desc(pct_1)) %>%
+    print()
+}
+
+for (col in colnames(churn %>% select_if(is.factor))){
+  print(col)
+  category_eval(col)
+}
+```
+
+## Explore correlation
+```{r}
+library(corrplot)
+cormat <- cor(select_if(churn%>%na.omit(),is.numeric))
+round(cormat, 2)
+corrplot(cormat)
+```
+
+## mutate date into days
+```{r}
+churn %>%
+  mutate(regday=as.numeric(Sys.Date()-customer_reg_date))->churn
+```
+
+# Tain Test Split 
+```{r}
+set.seed(123)
+
+train_test_spit<- initial_split(churn, prop = 0.7, strata = churn)
+
+train <- training(train_test_spit)
+test  <- testing(train_test_spit)
+
+sprintf("Train PCT : %1.2f%%", nrow(train)/ nrow(churn) * 100)
+sprintf("Test  PCT : %1.2f%%", nrow(test)/ nrow(churn) * 100)
+```
+
+# Logistic Models
+## Standard Logistic Model 
+```{r}
+churn_recipe <- recipe(churn ~ ., 
+                      data = train) %>%
+  step_rm(customer_id,billing_address,billing_city,billing_postal,customer_reg_date,gender) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+logistic_spec <- logistic_reg() %>%
+  set_mode("classification") %>%
+  set_engine("glm")
+
+logistic_full_wf <- workflow() %>%
+  add_recipe(churn_recipe) %>%
+  add_model(logistic_spec) %>%
+  fit(train)
+
+logistic_full_wf %>%
+  pull_workflow_fit() %>%
+  tidy() %>%
+  mutate(across(is.numeric,round,3))
+
+logistic_full_wf %>%
+  pull_workflow_fit() %>%
+  vip()
+
+options(yardstick.event_first = FALSE)
+predict(logistic_full_wf, train, type="prob") %>%
+  bind_cols(predict(logistic_full_wf, train, type="class")) %>%
+  bind_cols(train) ->logistic_train
+logistic_train %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+
+predict(logistic_full_wf, test, type="prob") %>%
+  bind_cols(predict(logistic_full_wf, test, type="class")) %>%
+  bind_cols(test) -> logistic_test 
+
+logistic_test %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+```
+
+## Recuded Logistic
+```{r}
+churn_recipe1 <- recipe(churn ~ ., 
+                      data = train) %>%
+  step_rm(customer_id,billing_address,billing_city,billing_postal,customer_reg_date,
+          senior_citizen,customer_service_calls,gender,
+          partner,multiple_lines,wifi_calling_text) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+logistic_r_wf <- workflow() %>%
+  add_recipe(churn_recipe1) %>%
+  add_model(logistic_spec) %>%
+  fit(train)
+
+logistic_r_wf %>%
+  pull_workflow_fit() %>%
+  tidy() %>%
+  mutate(across(is.numeric,round,3))
+
+logistic_r_wf %>%
+  pull_workflow_fit() %>%
+  vip()
+
+options(yardstick.event_first = FALSE)
+predict(logistic_r_wf, train, type="prob") %>%
+  bind_cols(predict(logistic_r_wf, train, type="class")) %>%
+  bind_cols(train)  ->logistic_r_train
+logistic_r_train %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+
+predict(logistic_r_wf, test, type="prob") %>%
+  bind_cols(predict(logistic_r_wf, test, type="class")) %>%
+  bind_cols(test) -> logistic_r_test 
+logistic_r_test %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+```
+
+## Compare models 
+```{r}
+logistic_test %>%
+  mutate(name="full logistic") %>%
+  bind_rows(logistic_r_test %>% mutate(name="reduced logistic")) %>%
+  group_by(name) %>%
+  metrics(churn, estimate = .pred_class, .pred_1) %>%
+  pivot_wider(id_cols=name, names_from=.metric,values_from=.estimate)%>%
+  arrange(desc(roc_auc))
+```
+
+## Confusion Matrix
+```{r}
+logistic_test %>%
+  conf_mat(churn, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") + labs(title="confusion matrix full logistic test")
+
+logistic_r_test %>%
+  conf_mat(churn, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") + labs(title="confusion matrix reduced logistic test")
+
+logistic_train %>%
+  conf_mat(churn, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") + labs(title="confusion matrix full logistic train")
+
+logistic_r_train %>%
+  conf_mat(churn, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") + labs(title="confusion matrix reduced logistic train")
+```
+
+## recall, precision, threshold
+```{r}
+logistic_test %>%
+  pr_curve(churn, .pred_1) %>%
+  mutate(
+    recall = round(recall, 2),
+    .threshold = round(.threshold, 3),
+    precision = round(precision, 3)
+  ) %>%
+  group_by(recall) %>%
+  summarise(precision = max(precision),
+            .threshold = min(.threshold))
+
+logistic_r_test %>%
+  pr_curve(churn, .pred_1) %>%
+  mutate(
+    recall = round(recall, 2),
+    .threshold = round(.threshold, 3),
+    precision = round(precision, 3)
+  ) %>%
+  group_by(recall) %>%
+  summarise(precision = max(precision),
+            .threshold = min(.threshold))
+```
+
+## Score distribution
+```{r}
+logistic_test %>%
+  #filter(churn==1) %>%
+  ggplot(aes(.pred_1, fill=churn)) +
+  geom_histogram(bins=100) +
+  xlim(0, 1) +
+  geom_vline(aes(xintercept=0.282)) +
+  labs(title="full logistic score distribution")
+
+logistic_r_test %>%
+  #filter(churn==1) %>%
+  ggplot(aes(.pred_1, fill=churn)) +
+  geom_histogram(bins=100) +
+  xlim(0, 1) +
+  geom_vline(aes(xintercept=0.269)) +
+  labs(title="reduced logistic score distribution")
+
+
+```
+
+## change threshold
+```{r}
+logistic_r_test %>%
+  mutate(predict_class = as.factor(if_else(.pred_1 >=0.269,1,0))) %>%
+  conf_mat(churn, estimate = predict_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title="confusion matrix threshold >= 0.269")
+```
+
+## ROC Curve
+```{r}
+bind_rows(logistic_test %>%
+  mutate(model = "full logistic test"), 
+logistic_train %>%
+  mutate(model = "full logistic train"),
+logistic_r_test %>%mutate(model="reduced logistic test"),
+logistic_r_train %>% mutate(model="reduced logistic train")) %>%
+  group_by(model) %>%
+  roc_curve(churn, .pred_1) %>%
+  autoplot() +
+  labs(title = "ROC chart")
+```
+
+# Decision trees
+# Default tree
+```{r}
+tree_spec <- decision_tree(c=0) %>%
+  set_mode("classification") %>%
+  set_engine("rpart")
+
+tree_wf1 <- workflow() %>%
+  add_recipe(churn_recipe) %>%
+  add_model(tree_spec) %>%
+  fit(train)
+
+tree_wf1 %>%
+  pull_workflow_fit() %>%
+  vip()
+
+# -- deal w. the first event issue -- # 
+options(yardstick.event_first = FALSE)
+predict(tree_wf1, train, type="prob") %>%
+  bind_cols(predict(tree_wf1, train, type="class")) %>%
+  bind_cols(train) ->tree_train1
+tree_train1%>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+
+predict(tree_wf1, test, type="prob") %>%
+  bind_cols(predict(tree_wf1, test, type="class")) %>%
+  bind_cols(test) -> tree_test1
+
+tree_test1 %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+```
+
+## calculate cp
+```{r}
+bake_train <- bake(churn_recipe%>%prep(), new_data = train)
+set.seed(123)
+churn_tree1 <- train(churn ~ .,
+                   data = bake_train, 
+                  method="rpart",
+                  trControl = trainControl("cv", number = 40),
+                  tuneLength = 20)
+plot(churn_tree1)
+churn_tree1$bestTune
+```
+
+## Best cp tree
+```{r}
+tree_spec2 <- decision_tree(c=0.001609,tree_depth=10,min_n=2) %>%
+  set_mode("classification") %>%
+  set_engine("rpart")
+
+tree_wf2 <- workflow() %>%
+  add_recipe(churn_recipe) %>%
+  add_model(tree_spec2) %>%
+  fit(train)
+
+tree_wf2 %>%
+  pull_workflow_fit() %>%
+  vip()
+
+# -- deal w. the first event issue -- # 
+options(yardstick.event_first = FALSE)
+predict(tree_wf2, train, type="prob") %>%
+  bind_cols(predict(tree_wf2, train, type="class")) %>%
+  bind_cols(train) ->tree_train2
+tree_train2%>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+
+predict(tree_wf2, test, type="prob") %>%
+  bind_cols(predict(tree_wf2, test, type="class")) %>%
+  bind_cols(test) -> tree_test2
+tree_test2 %>%
+  metrics(churn, estimate = .pred_class, .pred_1)
+```
+
+## Compare models
+```{r}
+tree_test1 %>%
+  mutate(name="Default tree") %>%
+  bind_rows(tree_test2 %>% mutate(name="Best complexity tree")) %>%
+  group_by(name) %>%
+  metrics(churn, estimate = .pred_class, .pred_1) %>%
+  pivot_wider(id_cols=name, names_from=.metric,values_from=.estimate) %>%
+  arrange(desc(roc_auc))
+```
+
+## Confusion Matrix
+```{r}
+tree_test1 %>%
+  conf_mat(churn, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") + labs(title="default tree test")
+
+tree_test2 %>%
+  conf_mat(churn, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") + labs(title="best complexity tree test")
+
+tree_train1 %>%
+  conf_mat(churn, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") + labs(title="default tree train")
+
+tree_train2 %>%
+  conf_mat(churn, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") + labs(title="best complexity tree train")
+```
+
+## ROC Curve
+```{r}
+bind_rows(tree_test1 %>%
+  mutate(model = "default tree test"), 
+tree_train1 %>%
+  mutate(model = "default tree train"),
+tree_test2 %>%mutate(model="reduced logistic test"),
+tree_train2 %>% mutate(model="reduced logistic train")) %>%
+  group_by(model) %>%
+  roc_curve(churn, .pred_1) %>%
+  autoplot() +
+  labs(title = "ROC chart")
+```
+
+## recall, precision, threshold
+```{r}
+tree_test1 %>%
+  pr_curve(churn, .pred_1) %>%
+  mutate(
+    recall = round(recall, 2),
+    .threshold = round(.threshold, 3),
+    precision = round(precision, 3)
+  ) %>%
+  group_by(recall) %>%
+  summarise(precision = max(precision),
+            .threshold = min(.threshold))
+tree_test2 %>%
+  pr_curve(churn, .pred_1) %>%
+  mutate(
+    recall = round(recall, 2),
+    .threshold = round(.threshold, 3),
+    precision = round(precision, 3)
+  ) %>%
+  group_by(recall) %>%
+  summarise(precision = max(precision),
+            .threshold = min(.threshold))
+```
+
+## Score distribution
+```{r}
+tree_test1 %>%
+  #filter(churn==1) %>%
+  ggplot(aes(.pred_1, fill=churn)) +
+  geom_histogram(bins=100) +
+  xlim(0, 1) +
+  geom_vline(aes(xintercept=0.058)) +
+  labs(title="default tree score distribution")
+
+tree_test2 %>%
+  #filter(churn==1) %>%
+  ggplot(aes(.pred_1, fill=churn)) +
+  geom_histogram(bins=100) +
+  xlim(0, 1) +
+  geom_vline(aes(xintercept=0.119)) +
+  labs(title="best complexity tree score distribution")
+```
+
+
