@@ -1,0 +1,380 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(kableExtra)
+library(GGally)
+library(vip) 
+library(fastshap) 
+library(rpart.plot) 
+library(MASS)
+library(caret)
+library(rpart)
+library(glmnet)
+library(reshape2)
+```
+
+# Import training data set
+```{r}
+fraud <- read_csv("project_2_training.csv") %>% clean_names()
+head(fraud)
+```
+
+
+# Explore data
+## skim
+```{r}
+fraud%>%skim_without_charts()
+```
+
+## billing_city, user_agent, email_domain, billing_postal mutate
+```{r}
+city_freq_count  <- fraud %>%
+  count(billing_city, sort=TRUE) %>%
+  dplyr::select(billing_city, billing_city_count = n)
+fraud <- fraud %>%
+  left_join(city_freq_count) %>%
+  dplyr::select(-billing_city)
+
+postal_freq_count  <- fraud %>%
+  count(billing_postal, sort=TRUE) %>%
+  dplyr::select(billing_postal, billing_postal_count = n)
+fraud <- fraud %>%
+  left_join(postal_freq_count) %>%
+  dplyr::select(-billing_postal)
+
+user_agent_freq<- fraud %>%
+  count(user_agent, sort=TRUE) %>%
+  dplyr::select(user_agent, user_agent_count = n)
+fraud <- fraud %>%
+  left_join(user_agent_freq) %>%
+  dplyr::select(-user_agent)
+
+domain_freq<- fraud %>%
+  count(email_domain, sort=TRUE) %>%
+  dplyr::select(email_domain, email_domain_count = n)
+fraud <- fraud %>%
+  left_join(domain_freq) %>%
+  dplyr::select(-email_domain)
+
+```
+
+
+## Explore target
+```{r}
+fraud %>%
+  count(event_label) %>%
+  mutate(pct = n/sum(n)) -> fraud_rate
+
+fraud_rate %>%
+  ggplot(aes(x=event_label, y=pct)) +
+  geom_col() +
+  geom_text(aes(label=pct) ,color="red") + 
+  labs(title="Fraud Rate")
+```
+
+## Explore numerics
+```{r}
+ggplot(fraud, aes(x=account_age_days,y=event_label,group=event_label)) + geom_boxplot() +labs(title = "Account Age Days")
+ggplot(fraud, aes(x=transaction_amt,y=event_label,group=event_label)) + geom_boxplot() +labs(title = "Transaction Amount")
+ggplot(fraud, aes(x=transaction_adj_amt,y=event_label,group=event_label)) + geom_boxplot() +labs(title = "Adjusted Transaction Amount")
+ggplot(fraud, aes(x=historic_velocity,y=event_label,group=event_label)) + geom_boxplot() +labs(title = "Historic Velocity")
+ggplot(fraud, aes(x=days_since_last_logon,y=event_label,group=event_label)) + geom_boxplot() +labs(title = "Days Since Last Logon")
+ggplot(fraud, aes(x=inital_amount,y=event_label,group=event_label)) + geom_boxplot() +labs(title = "Inital Amount")
+ggplot(fraud, aes(x=billing_city_count,y=event_label,group=event_label)) + geom_boxplot() +labs(title = "Billing City Count ")
+ggplot(fraud, aes(x=user_agent_count,y=event_label,group=event_label)) + geom_boxplot() +labs(title = "User Agent")
+ggplot(fraud, aes(x=email_domain_count,y=event_label,group=event_label)) + geom_boxplot() +labs(title = "Email Domain")
+ggplot(fraud, aes(x=billing_postal_count,y=event_label,group=event_label)) + geom_boxplot() +labs(title = "Billing Postal")
+
+
+
+
+```
+
+## Explore characters
+### barplot
+```{r}
+bar_plot <- function(a,colname){
+    fraud %>%
+    ggplot(., aes(a)) + 
+    geom_bar(aes(fill = event_label), position = "fill") +
+    labs(title = paste("Barplot for",colname), x = colname, y="percent")+
+    geom_hline(yintercept = 0.94572)+
+    theme(axis.text.x = element_text(angle = 90, hjust = 0.5, vjust = 0.5))
+}
+
+bar_plot(fraud$billing_state,"Billing State")
+bar_plot(fraud$currency,"Currency")
+bar_plot(fraud$cvv,"cvv")
+bar_plot(fraud$signature_image,"Signature Image")
+bar_plot(fraud$transaction_type,"Transaction Type")
+bar_plot(fraud$transaction_env,"Transaction Env")
+bar_plot(fraud$tranaction_initiate,"Transaction Initiate")
+
+```
+
+### chart
+```{r}
+category_eval <- function(col){
+  
+fraud%>% 
+  group_by(event_label) %>%
+  count(!!as.name(col)) %>%
+  pivot_wider(values_from=c(n), names_from = event_label) %>%
+      mutate(pct_1 = `1`/ (`0` + `1`),
+             pct_0 = 1 - pct_1) %>%
+    arrange(desc(pct_1)) %>%
+    print()
+}
+
+for (col in colnames(fraud %>% select_if(is.factor))){
+  print(col)
+  category_eval(col)
+}
+```
+
+
+## Change target into 0/1
+```{r}
+fraud <- fraud %>%
+  mutate(event_label=if_else(event_label=="legit",0,1)) 
+```
+
+## Explore correlation
+```{r}
+library(corrplot)
+cormat <- cor(select_if(fraud%>%na.omit(),is.numeric))
+round(cormat, 2)
+corrplot(cormat)
+```
+
+## Make factors
+```{r}
+fraud <- fraud %>%
+  mutate(event_label =as_factor(event_label))%>%
+  mutate_if(is.character,as_factor)
+```
+
+
+# Tain Test Split 
+```{r}
+set.seed(123)
+
+train_test_spit<- initial_split(fraud, prop = 0.7, strata = event_label)
+
+train <- training(train_test_spit)
+test  <- testing(train_test_spit)
+
+sprintf("Train PCT : %1.2f%%", nrow(train)/ nrow(fraud) * 100)
+sprintf("Test  PCT : %1.2f%%", nrow(test)/ nrow(fraud) * 100)
+```
+
+## random forest full 100 trees
+```{r}
+recipe3 <- recipe(event_label ~ ., 
+                      data = train) %>%
+  step_rm(applicant_name,billing_address,merchant_id,event_id,ip_address,phone_number,card_bin,event_timestamp,locale,days_since_last_logon,inital_amount,tranaction_initiate) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+rf_1 <-  rand_forest(trees=100) %>%
+  set_mode("classification") %>%
+  set_engine("ranger",  importance = "impurity") 
+
+random_wf<-workflow() %>% 
+  add_recipe(recipe3) %>% 
+  add_model(rf_1) %>% 
+  fit(train)
+
+options(yardstick.event_first = FALSE)
+predict(random_wf, train, type="prob") %>%
+  bind_cols(predict(random_wf, train, type="class")) %>%
+  bind_cols(train)  -> random_train
+random_train%>%
+  metrics(event_label, estimate = .pred_class, .pred_1)
+
+predict(random_wf, test, type="prob") %>%
+  bind_cols(predict(random_wf, test, type="class")) %>%
+  bind_cols(test) -> random_test
+
+random_test %>%
+  metrics(event_label, estimate = .pred_class, .pred_1)
+
+random_wf %>%
+  pull_workflow_fit() %>%
+  vip()
+```
+
+## logistic 
+```{r}
+logistic_spec <- logistic_reg() %>%
+  set_mode("classification") %>%
+  set_engine("glm")
+
+logistic_wf <- workflow() %>%
+  add_recipe(recipe3) %>%
+  add_model(logistic_spec) %>%
+  fit(train)
+
+logistic_wf %>%
+  pull_workflow_fit() %>%
+  tidy() %>%
+  mutate(across(is.numeric,round,3))
+
+logistic_wf %>%
+  pull_workflow_fit() %>%
+  vip()
+
+options(yardstick.event_first = FALSE)
+predict(logistic_wf, train, type="prob") %>%
+  bind_cols(predict(logistic_wf, train, type="class")) %>%
+  bind_cols(train) ->logistic_train
+logistic_train %>%
+  metrics(event_label, estimate = .pred_class, .pred_1)
+
+predict(logistic_wf, test, type="prob") %>%
+  bind_cols(predict(logistic_wf, test, type="class")) %>%
+  bind_cols(test) -> logistic_test 
+
+logistic_test %>%
+  metrics(event_label, estimate = .pred_class, .pred_1)
+```
+
+## tree
+```{r}
+tree_spec <- decision_tree(c=0, tree_depth=10) %>%
+  set_mode("classification") %>%
+  set_engine("rpart")
+
+tree_wf <- workflow() %>%
+  add_recipe(recipe3) %>%
+  add_model(tree_spec) %>%
+  fit(train)
+
+tree_wf %>%
+  pull_workflow_fit() %>%
+  vip()
+
+options(yardstick.event_first = FALSE)
+predict(tree_wf, train, type="prob") %>%
+  bind_cols(predict(tree_wf, train, type="class")) %>%
+  bind_cols(train) ->tree_train
+tree_train %>%
+  metrics(event_label, estimate = .pred_class, .pred_1)
+
+predict(tree_wf, test, type="prob") %>%
+  bind_cols(predict(tree_wf, test, type="class")) %>%
+  bind_cols(test) -> tree_test 
+
+tree_test %>%
+  metrics(event_label, estimate = .pred_class, .pred_1)
+```
+
+## ROC
+```{r}
+bind_rows(random_test %>%
+  mutate(model = "Random Forest Test"), 
+random_train %>%
+  mutate(model = "Random Forest Train"),
+logistic_test %>%mutate(model="Logistic Test"),
+logistic_train %>% mutate(model="Logistic train"),
+tree_test %>%mutate(model="Decision Tree Test"),
+tree_train %>% mutate(model="Decision Tree train")) %>%
+  group_by(model) %>%
+  roc_curve(event_label, .pred_1) %>%
+  autoplot() +
+  labs(title = "ROC chart")
+```
+
+## Confusion Matrix
+```{r}
+random_train %>%
+  conf_mat(event_label, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") + labs(title="random forest train")
+random_test %>%
+  conf_mat(event_label, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") + labs(title="random forest test")
+logistic_train %>%
+  conf_mat(event_label, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") + labs(title="logistic regression train")
+logistic_test %>%
+  conf_mat(event_label, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") + labs(title="logistic regression test")
+tree_train %>%
+  conf_mat(event_label, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") + labs(title="decision tree train")
+tree_test %>%
+  conf_mat(event_label, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") + labs(title="decision tree test")
+
+```
+
+## tpr, fpr
+```{r}
+# -- calculate operating range -- 
+random_test %>%
+ roc_curve(event_label, .pred_1) %>%
+  mutate(fpr = round((1 - specificity),2),
+         tpr = round(sensitivity,3),
+         score_threshold = round(.threshold,3)) %>%
+  group_by(fpr) %>%
+  summarise(threshold = max(score_threshold),
+            tpr = max(tpr))%>%
+filter(fpr >= 0.01 & fpr <= 0.10)
+
+logistic_test %>%
+ roc_curve(event_label, .pred_1) %>%
+  mutate(fpr = round((1 - specificity),2),
+         tpr = round(sensitivity,3),
+         score_threshold = round(.threshold,3)) %>%
+  group_by(fpr) %>%
+  summarise(threshold = max(score_threshold),
+            tpr = max(tpr))%>%
+filter(fpr >= 0.01 & fpr <= 0.10)
+
+tree_test %>%
+ roc_curve(event_label, .pred_1) %>%
+  mutate(fpr = round((1 - specificity),2),
+         tpr = round(sensitivity,3),
+         score_threshold = round(.threshold,3)) %>%
+  group_by(fpr) %>%
+  summarise(threshold = max(score_threshold),
+            tpr = max(tpr))%>%
+filter(fpr >= 0.01 & fpr <= 0.10)
+```
+
+## score distribution
+```{r}
+random_test %>%
+  ggplot(aes(.pred_1, fill=event_label)) +
+  geom_histogram(bins=100) +
+  xlim(0, 1) +
+  geom_vline(aes(xintercept=0.091)) +
+  labs(title="random forest score distribution")
+
+logistic_test %>%
+  ggplot(aes(.pred_1, fill=event_label)) +
+  geom_histogram(bins=100) +
+  xlim(0, 1) +
+  geom_vline(aes(xintercept=0.071)) +
+  labs(title="logistic regression score distribution")
+
+tree_test %>%
+  ggplot(aes(.pred_1, fill=event_label)) +
+  geom_histogram(bins=100) +
+  xlim(0, 1) +
+  geom_vline(aes(xintercept=0.017)) +
+  labs(title="decision tree score distribution")
+```
+
