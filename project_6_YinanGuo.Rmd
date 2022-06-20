@@ -1,0 +1,1018 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# load library
+```{r}
+options (scipen = 999)
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(vip)
+library(parallel)
+library(doParallel)
+library(embed)
+library(rpart.plot) 
+library(rpart) 
+library(kableExtra)
+library(GGally)
+library(fastshap)  
+library(MASS)
+library(caret)
+library(glmnet)
+library(reshape2)
+library(textrecipes)
+library(DALEX)    # new
+library(DALEXtra) # new
+library(solitude)
+```
+
+# import data
+```{r}
+loan <- read_csv("loan_train.csv") %>%
+  clean_names() 
+head(loan)
+```
+# skim 
+```{r}
+loan %>%
+  skim() ->skim
+```
+# Data Munging
+```{r}
+loan %>%
+  dplyr::select(-mths_since_last_record,-mths_since_last_delinq,-next_pymnt_d,-url,-emp_title)%>%
+  mutate(term = as.numeric(chartr('months','      ',term))) %>%
+  mutate(int_rate = as.numeric(chartr('%',' ',int_rate))) %>%
+  mutate(sub_grade = as.numeric(substr(sub_grade,2,3))) %>%
+  mutate(zip_code = as.numeric(chartr('xx','  ',zip_code))) %>%
+  mutate(revol_util = as.numeric(chartr('%',' ',revol_util))) %>%
+  mutate(earliest_cr_line_mth = match(tolower(substr(earliest_cr_line,1,3)), tolower(month.abb))) %>%
+  mutate(earliest_cr_line_yr = as.numeric(substr(earliest_cr_line,5,9))) %>%
+  mutate(issue_d_mth = match(tolower(substr(issue_d,1,3)), tolower(month.abb))) %>%
+  mutate(issue_d_yr = as.numeric(substr(issue_d,5,9))) %>%
+  mutate(last_pymnt_d_mth = match(tolower(substr(last_pymnt_d,1,3)), tolower(month.abb))) %>%
+  mutate(last_pymnt_d_yr = as.numeric(substr(last_pymnt_d,5,9))) %>%
+  mutate(last_credit_pull_d_mth = match(tolower(substr(last_credit_pull_d,1,3)), tolower(month.abb))) %>%
+  mutate(last_credit_pull_d_yr = as.numeric(substr(last_credit_pull_d,5,9))) %>%
+  dplyr::select(-issue_d,-earliest_cr_line,-last_pymnt_d,-last_credit_pull_d,
+                -collections_12_mths_ex_med,-policy_code,-chargeoff_within_12_mths)->loan
+
+addr_state_freq <- loan %>%
+  group_by(addr_state) %>%
+  summarise(addr_state_freq = n()) 
+loan <- loan %>%
+  left_join(addr_state_freq)
+loan %>%
+  dplyr::select(-addr_state) ->loan
+
+
+title_freq <- loan %>%
+  group_by(title) %>%
+  summarise(title_freq = n()) 
+loan <- loan %>%
+  left_join(title_freq)
+loan %>%
+  dplyr::select(-title) ->loan
+
+loan%>%
+  mutate(issue_d=issue_d_yr+issue_d_mth/12,
+         earliest_cr_line=earliest_cr_line_yr+earliest_cr_line_mth/12,
+         last_pymnt_d=last_pymnt_d_yr+last_pymnt_d_mth/12,
+         last_credit_pull_d=last_credit_pull_d_yr+last_credit_pull_d_mth/12)->loan
+
+
+        
+```
+# Dealing with Text using Sentiment
+```{r}
+library(tidytext)
+afinn <- get_sentiments("afinn")
+
+sent_desc <- loan %>% 
+  unnest_tokens(word, desc) %>% 
+  filter(!word %in% stop_words) %>% 
+  inner_join(afinn) %>% 
+  group_by(id) %>% 
+  summarise(sentiment_desc = sum(value))
+
+loan <- loan %>% 
+  left_join(sent_desc)
+
+```
+
+# Target Encoding & As Factors
+```{r}
+loan %>%
+  mutate(loan_status = as.factor(if_else(loan_status == "default",1,0)))%>%
+  mutate_if(is.character,as_factor) %>%
+  mutate(desc=as.character(desc))->loan
+```
+
+# Data Exploration
+## Explore target
+```{r}
+loan %>%
+  count(loan_status) %>%
+  mutate(pct = n/sum(n)) -> default
+
+default %>%
+  ggplot(aes(x=loan_status, y=pct)) +
+  geom_col() +
+  geom_text(aes(label=pct) ,color="red") + 
+  labs(title="Default Rate")
+```
+## Explore numerics
+```{r}
+boxplot<- function(a,b){
+  ggplot(loan, aes(x={{a}},y=loan_status,group=loan_status)) + geom_boxplot() +labs(title = b)
+}
+
+boxplot(member_id,"member_id")
+boxplot(loan_amnt,"loan_amnt")
+boxplot(funded_amnt,"funded_amnt")
+boxplot(funded_amnt_inv,"funded_amnt_inv")
+boxplot(term,"term")
+boxplot(int_rate,"int_rate")
+boxplot(installment,"installment")
+boxplot(sub_grade,"sub_grade")
+boxplot(annual_inc,"annual_inc")
+boxplot(zip_code,"zip_code")
+boxplot(dti,"dti")
+boxplot(delinq_2yrs,"delinq_2yrs")
+boxplot(fico_range_low,"fico_range_low")
+boxplot(fico_range_high,"fico_range_high")
+boxplot(inq_last_6mths,"inq_last_6mths")
+boxplot(open_acc,"open_acc")
+boxplot(pub_rec,"pub_rec")
+boxplot(revol_bal,"revol_bal")
+boxplot(revol_util,"revol_util")
+boxplot(total_acc,"total_acc")
+boxplot(out_prncp,"out_prncp")
+boxplot(out_prncp_inv,"out_prncp_inv")
+boxplot(total_rec_late_fee,"total_rec_late_fee")
+boxplot(last_pymnt_amnt,"last_pymnt_amnt")
+boxplot(acc_now_delinq,"acc_now_delinq")
+boxplot(delinq_amnt,"delinq_amnt")
+boxplot(pub_rec_bankruptcies,"pub_rec_bankruptcies")
+boxplot(tax_liens,"tax_liens")
+boxplot(earliest_cr_line_mth,"earliest_cr_line_mth")
+boxplot(earliest_cr_line_yr,"earliest_cr_line_yr")
+boxplot(issue_d_mth,"issue_d_mth")
+boxplot(issue_d_yr,"issue_d_yr")
+boxplot(last_pymnt_d_mth,"last_pymnt_d_mth")
+boxplot(last_pymnt_d_yr,"last_pymnt_d_yr")
+boxplot(last_credit_pull_d_mth,"last_credit_pull_d_mth")
+boxplot(last_credit_pull_d_yr,"last_credit_pull_d_yr")
+boxplot(addr_state_freq,"addr_state_freq")
+```
+
+## Explore characters
+### barplot
+```{r}
+bar_plot <- function(a,colname){
+    loan %>%
+    ggplot(., aes(a)) + 
+    geom_bar(aes(fill = loan_status), position = "fill") +
+    labs(title = paste("Barplot for",colname), x = colname, y="percent")+
+    geom_hline(yintercept = 0.15035)+
+    theme(axis.text.x = element_text(angle = 90, hjust = 0.5, vjust = 0.5))
+}
+
+bar_plot(loan$grade,"grade")
+bar_plot(loan$emp_length,"emp_length")
+bar_plot(loan$home_ownership,"home_ownership")
+bar_plot(loan$verification_status,"verification_status")
+bar_plot(loan$pymnt_plan,"pymnt_plan")
+bar_plot(loan$purpose,"purpose")
+bar_plot(loan$application_type,"application_type")
+```
+
+## Explore correlation
+```{r}
+library(corrplot)
+cormat <- cor(select_if(loan%>%na.omit(),is.numeric))
+round(cormat, 2)
+corrplot(cormat,tl.cex  = 0.5)
+```
+
+
+# define train/test split 
+```{r}
+set.seed(42)
+train_test_spit<- initial_split(loan, prop = 0.7)
+
+train <- training(train_test_spit)
+test  <- testing(train_test_spit)
+
+train_cv_folds <- vfold_cv(train, v=5)
+```
+
+# Define Recipe
+```{r}
+loan_recipe <- recipe(loan_status ~ . , data = train) %>%
+  step_novel(all_nominal(), -all_outcomes())%>%
+  step_unknown(all_nominal(), -all_outcomes()) %>%
+  step_meanimpute(all_numeric())%>%
+  
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_tokenize(desc) %>%
+  step_tokenfilter(desc, max_tokens = 100) %>%
+  step_stopwords(desc) %>%
+  step_tfidf(desc) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_rm(id)
+  
+loan_recipe
+```
+# logistic
+```{r}
+recipe <- recipe(loan_status ~ . , data = train) %>%
+  step_novel(all_nominal(), -all_outcomes())%>%
+  step_unknown(all_nominal(), -all_outcomes()) %>%
+  step_meanimpute(all_numeric())%>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_tokenize(desc) %>%
+  step_tokenfilter(desc, max_tokens = 100) %>%
+  step_stopwords(desc) %>%
+  step_tfidf(desc) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_rm(id,funded_amnt,int_rate,dti,addr_state_freq,delinq_2yrs,out_prncp,acc_now_delinq,delinq_amnt,pub_rec_bankruptcies,tfidf_desc_08,tfidf_desc_09,tfidf_desc_10)
+  
+
+logistic_spec <- logistic_reg() %>%
+  set_mode("classification") %>%
+  set_engine("glm")
+
+logistic_full_wf1 <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(logistic_spec) %>%
+  fit(train)
+
+logistic_full_wf1 %>%
+  pull_workflow_fit() %>%
+  tidy() %>%
+  mutate(across(is.numeric,round,3))
+
+logistic_full_wf1 %>%
+  pull_workflow_fit() %>%
+  vip(10)
+
+options(yardstick.event_first = FALSE)
+predict(logistic_full_wf1, train, type="prob") %>%
+  bind_cols(predict(logistic_full_wf1, train, type="class")) %>%
+  bind_cols(train) ->logistic_train1
+
+predict(logistic_full_wf1, test, type="prob") %>%
+  bind_cols(predict(logistic_full_wf1, test, type="class")) %>%
+  bind_cols(test) -> logistic_test1
+
+
+logistic_train1 %>% 
+    metrics(loan_status, .pred_1, estimate = .pred_class) %>%
+    mutate(part="training") %>%
+    bind_rows( logistic_test1 %>% 
+                 metrics(loan_status, .pred_1, estimate = .pred_class) %>%
+                 mutate(part="testing") ) %>%
+    filter(.metric %in% c('accuracy','roc_auc','mn_log_loss')) %>%
+    pivot_wider(names_from = .metric, values_from=.estimate)
+  
+logistic_train1 %>%
+    conf_mat(loan_status, .pred_class) %>%
+    autoplot(type = "heatmap")
+  
+logistic_test1 %>%
+    conf_mat(loan_status, .pred_class) %>%
+    autoplot(type = "heatmap")
+  
+  # -- ROC Charts 
+  logistic_train1 %>%
+  mutate(model = "train") %>%
+  bind_rows(logistic_test1 %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(loan_status, .pred_1) %>%
+  autoplot() 
+
+```
+## KS and ROC in operating range
+```{r}
+# -- calculate KS  -- 
+logistic_test1 %>%
+ roc_curve(loan_status, .pred_1) %>%
+  mutate(fpr = round((1 - specificity),2),
+         tpr = round(sensitivity,3),
+         score_threshold = round(.threshold,3)) %>%
+  mutate(diff_tprfpr = tpr - fpr) %>%
+  slice_max(diff_tprfpr,n=1, with_ties = FALSE) %>%
+  dplyr::select(fpr,tpr,score_threshold,ks = diff_tprfpr)
+
+logistic_test1 %>%
+ roc_curve(loan_status, .pred_1) %>%
+  autoplot() +
+  geom_vline(aes(xintercept=0.06, color="red")) +
+  labs(title="ROC operating at 6% FPR")
+
+logistic_test1 %>%
+  pr_curve(loan_status, .pred_1) %>%
+  mutate(
+    recall = round(recall, 2),
+    .threshold = round(.threshold, 3),
+    precision = round(precision, 3),
+    f1 = round(2*precision*recall/(precision+recall),3)
+  ) %>%
+  group_by(recall) %>%
+  summarise(precision = max(precision),
+            .threshold = min(.threshold),
+            f1 = max(f1))
+logistic_test1 %>%
+  ggplot(aes(.pred_1, fill=loan_status)) +
+  geom_histogram(bins=100) +
+  xlim(0, 1) +
+  geom_vline(aes(xintercept=0.11)) +
+  labs(title="logistic score distribution")
+
+```
+
+# Random Forest
+
+## tune grid
+```{r}
+rf_tune <- rand_forest(
+    trees  = tune(),
+    min_n = tune()) %>% 
+    set_engine("ranger", importance = "impurity") %>% 
+    set_mode("classification")
+
+# -- setup workflow 
+rf_workflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(rf_tune) 
+
+# -- setup your tuning grid -- random force 
+tune_grid1 <- grid_random(trees(),
+                         min_n(),
+                        size = 5)
+print(tune_grid1)
+
+# -- setup parallel process 
+all_cores <- detectCores(logical = TRUE)
+sprintf("# of Logical Cores: %d", all_cores)
+cl <- makeCluster(all_cores)
+registerDoParallel(cl)
+
+# -- train!! K times for each parameter -- 
+rf_tuning_results <- rf_workflow %>% 
+  tune_grid(
+    resamples = train_cv_folds,
+    grid = tune_grid1,
+    control = control_resamples(save_pred = TRUE)
+    )
+
+rf_tuning_results
+```
+## refit
+```{r}
+rf_tuning_results %>% 
+  collect_metrics() %>%
+  mutate_if(is.numeric, round,3) %>% 
+  pivot_wider(names_from = .metric, values_from=c(mean, std_err))
+
+rf_best <- rf_tuning_results %>%
+  select_best("roc_auc") 
+print(rf_best)
+
+rf_final_wf <- rf_workflow %>% 
+  finalize_workflow(rf_best)
+print(rf_final_wf)
+
+rf_final_fit  <- rf_final_wf %>%
+  fit(data = train) 
+```
+## evaluation
+```{r}
+options(yardstick.event_first = FALSE)
+predict(rf_final_fit, train, type="prob") %>%
+  bind_cols(predict(rf_final_fit, train, type="class")) %>%
+  bind_cols(train) ->rf_train2
+
+predict(rf_final_fit, test, type="prob") %>%
+  bind_cols(predict(rf_final_fit, test, type="class")) %>%
+  bind_cols(test) -> rf_test2
+
+
+rf_train2 %>% 
+    metrics(loan_status, .pred_1, estimate = .pred_class) %>%
+    mutate(part="training") %>%
+    bind_rows( rf_test2 %>% 
+                 metrics(loan_status, .pred_1, estimate = .pred_class) %>%
+                 mutate(part="testing") ) %>%
+    filter(.metric %in% c('accuracy','roc_auc','mn_log_loss')) %>%
+    pivot_wider(names_from = .metric, values_from=.estimate)
+  
+  rf_train2 %>%
+    conf_mat(loan_status, .pred_class) %>%
+    autoplot(type = "heatmap")
+  
+   rf_test2 %>%
+    conf_mat(loan_status, .pred_class) %>%
+    autoplot(type = "heatmap")
+  
+  # -- ROC Charts 
+  rf_train2 %>%
+  mutate(model = "train") %>%
+  bind_rows(rf_test2 %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(loan_status, .pred_1) %>%
+  autoplot() 
+
+    # -- variable importance: top 10
+  rf_final_fit %>%
+    pull_workflow_fit() %>%
+  vip(num_features = 10)
+```
+
+## handy
+```{r}
+rf_model <- rand_forest(
+    trees  = 199,min_n=18) %>% 
+    set_engine("ranger", importance = "impurity") %>% 
+    set_mode("classification")
+rf_workflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(rf_model) %>%
+  fit(data=train)
+
+options(yardstick.event_first = FALSE)
+predict(rf_workflow, train, type="prob") %>%
+  bind_cols(predict(rf_workflow, train, type="class")) %>%
+  bind_cols(train) ->rf_train1
+
+rf_train1 %>%
+  metrics(loan_status, estimate = .pred_class, .pred_1)
+
+predict(rf_workflow, test, type="prob") %>%
+  bind_cols(predict(rf_workflow, test, type="class")) %>%
+  bind_cols(test) -> rf_test1
+
+rf_test1 %>%
+  metrics(loan_status, estimate = .pred_class, .pred_1)
+
+rf_train1 %>% 
+    metrics(loan_status, .pred_1, estimate = .pred_class) %>%
+    mutate(part="training") %>%
+    bind_rows( rf_test1 %>% 
+                 metrics(loan_status, .pred_1, estimate = .pred_class) %>%
+                 mutate(part="testing") ) %>%
+    filter(.metric %in% c('accuracy','roc_auc','mn_log_loss')) %>%
+    pivot_wider(names_from = .metric, values_from=.estimate)
+```
+## KS and ROC in operating range
+```{r}
+# -- calculate KS  -- 
+rf_test1 %>%
+ roc_curve(loan_status, .pred_1) %>%
+  mutate(fpr = round((1 - specificity),2),
+         tpr = round(sensitivity,3),
+         score_threshold = round(.threshold,3)) %>%
+  mutate(diff_tprfpr = tpr - fpr) %>%
+  slice_max(diff_tprfpr,n=1, with_ties = FALSE) %>%
+  dplyr::select(fpr,tpr,score_threshold,ks = diff_tprfpr)
+
+rf_test1 %>%
+ roc_curve(loan_status, .pred_1) %>%
+  autoplot() +
+  geom_vline(aes(xintercept=0.05, color="red")) +
+  labs(title="ROC operating at 5% FPR")
+
+rf_test1 %>%
+  pr_curve(loan_status, .pred_1) %>%
+  mutate(
+    recall = round(recall, 2),
+    .threshold = round(.threshold, 3),
+    precision = round(precision, 3),
+    f1 = round(2*precision*recall/(precision+recall),3)
+  ) %>%
+  group_by(recall) %>%
+  summarise(precision = max(precision),
+            .threshold = min(.threshold),
+            f1 = max(f1))
+
+rf_test1 %>%
+  ggplot(aes(.pred_1, fill=loan_status)) +
+  geom_histogram(bins=100) +
+  xlim(0, 1) +
+  geom_vline(aes(xintercept=0.255)) +
+  labs(title="rf score distribution")
+```
+
+# XGB
+## tune grid
+```{r}
+xgb_model <- boost_tree(
+  trees = 200, 
+  tree_depth = 10,       ## how deep of a tree, model complexity
+  min_n = tune(),            ## minimum number of observations 
+  #learn_rate = tune()        
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_model
+
+# -- setup workflow 
+xgb_workflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(xgb_model) 
+# -- setup your tuning grid -- random force 
+tune_grid <- grid_random(#trees(),
+                         min_n(),
+                         #tree_depth(),
+                        #learn_rate(),
+                        
+                          size = 5)
+print(tune_grid)
+```
+## Review Tuning Results 
+```{r}
+ xgb_tuning_results <- xgb_workflow %>% 
+   tune_grid(
+     resamples = train_cv_folds,
+     grid = tune_grid,
+     control = control_resamples(save_pred = TRUE)
+     )
+ 
+ xgb_tuning_results
+
+## -- results of tuning -- 
+ xgb_tuning_results %>% 
+   collect_metrics() %>%
+   mutate_if(is.numeric, round,3) %>% 
+   pivot_wider(names_from = .metric, values_from=c(mean, std_err))
+```
+## selecting "best" parameters 
+```{r}
+xgb_tuning_results %>%
+  show_best("roc_auc") %>%
+  print()
+
+xgb_best <- xgb_tuning_results %>%
+  select_best("roc_auc") 
+
+print(xgb_best)
+```
+## refitting workflow with "best" parameter
+```{r}
+library(glmnet)
+library(workflows)
+xgb_final_wf <- xgb_workflow %>% 
+  finalize_workflow(xgb_best)
+
+print(xgb_final_wf)
+
+xgb_final_fit  <- xgb_final_wf %>%
+  fit(data = train) 
+```
+
+## score xgb model
+```{r}
+predict(xgb_final_fit , train, type="prob") %>%
+    bind_cols(predict(xgb_final_fit, train, type="class")) %>%
+    bind_cols(.,train)-> scored_xgb_train 
+
+predict(xgb_final_fit , test, type="prob") %>%
+    bind_cols(predict(xgb_final_fit, test, type="class")) %>%
+    bind_cols(.,test) -> scored_xgb_test   
+
+scored_xgb_train %>% 
+    metrics(loan_status, .pred_1, estimate = .pred_class) %>%
+    mutate(part="training") %>%
+    bind_rows( scored_xgb_test %>% 
+                 metrics(loan_status, .pred_1, estimate = .pred_class) %>%
+                 mutate(part="testing") ) %>%
+    filter(.metric %in% c('accuracy','roc_auc','mn_log_loss')) %>%
+    pivot_wider(names_from = .metric, values_from=.estimate)
+  
+scored_xgb_train %>%
+    conf_mat(loan_status, .pred_class) %>%
+    autoplot(type = "heatmap")
+  
+scored_xgb_test %>%
+    conf_mat(loan_status, .pred_class) %>%
+    autoplot(type = "heatmap")
+  
+  # -- ROC Charts 
+scored_xgb_train %>%
+  mutate(model = "train") %>%
+  bind_rows(scored_xgb_test %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(loan_status, .pred_1) %>%
+  autoplot() 
+
+    # -- variable importance: top 10
+  xgb_final_fit %>%
+    pull_workflow_fit() %>%
+  vip(num_features = 10)
+```
+
+## handy model
+```{r}
+xgb_model <- boost_tree(
+    trees = 200,  
+    min_n=14,
+    tree_depth=10,
+    #learn_rate= 0.012312104
+    ) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+# -- define workflows
+xgb_model_wf <- workflow() %>%
+  add_recipe(loan_recipe) %>%
+  add_model(xgb_model) 
+
+xgb_model_fit <- xgb_model_wf %>%
+            fit(data=train)
+```
+## score
+```{r}
+options(yardstick.event_first = FALSE)
+scored_train <-predict(xgb_model_fit  , train, type="prob") %>%
+bind_cols(predict(xgb_model_fit  , train, type="class")) %>%
+bind_cols(train)
+
+ scored_test <-predict(xgb_model_fit  , test, type="prob") %>%
+bind_cols(predict(xgb_model_fit , test, type="class")) %>%
+bind_cols(test)
+
+scored_train %>% 
+    metrics(loan_status, .pred_1, estimate = .pred_class) %>%
+    mutate(part="training") %>%
+    bind_rows( scored_test %>% 
+                 metrics(loan_status, .pred_1, estimate = .pred_class) %>%
+                 mutate(part="testing") ) %>%
+    filter(.metric %in% c('accuracy','roc_auc')) %>%
+    pivot_wider(names_from = .metric, values_from=.estimate)
+
+options(yardstick.event_first = FALSE)
+scored_train %>%
+    conf_mat(loan_status, .pred_class) %>%
+    autoplot(type = "heatmap")
+  
+scored_test %>%
+    conf_mat(loan_status, .pred_class) %>%
+    autoplot(type = "heatmap")
+  
+  # -- ROC Charts 
+scored_train %>%
+  mutate(model = "train") %>%
+  bind_rows(scored_test %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(loan_status, .pred_1) %>%
+  autoplot() 
+
+xgb_model_fit %>%
+    pull_workflow_fit() %>%
+  vip(num_features = 40)
+
+recipe <- recipe(loan_status ~ . , data = train) %>%
+  step_novel(all_nominal(), -all_outcomes())%>%
+  step_unknown(all_nominal(), -all_outcomes()) %>%
+  step_meanimpute(all_numeric())%>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_tokenize(desc) %>%
+  step_tokenfilter(desc, max_tokens = 100) %>%
+  step_stopwords(desc) %>%
+  step_tfidf(desc) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_rm(id,funded_amnt,int_rate,delinq_2yrs,out_prncp,acc_now_delinq,delinq_amnt,pub_rec_bankruptcies,tfidf_desc_08,tfidf_desc_09,tfidf_desc_10)
+```
+## KS and ROC in operating range
+```{r}
+# -- calculate KS  -- 
+scored_test %>%
+ roc_curve(loan_status, .pred_1) %>%
+  mutate(fpr = round((1 - specificity),2),
+         tpr = round(sensitivity,3),
+         score_threshold = round(.threshold,3)) %>%
+  mutate(diff_tprfpr = tpr - fpr) %>%
+  slice_max(diff_tprfpr,n=1, with_ties = FALSE) %>%
+  dplyr::select(fpr,tpr,score_threshold,ks = diff_tprfpr)
+
+scored_test %>%
+ roc_curve(loan_status, .pred_1) %>%
+  autoplot() +
+  geom_vline(aes(xintercept=0.03, color="red")) +
+  labs(title="ROC operating at 3% FPR")
+
+scored_test %>%
+  pr_curve(loan_status, .pred_1) %>%
+  mutate(
+    recall = round(recall, 2),
+    .threshold = round(.threshold, 3),
+    precision = round(precision, 3),
+    f1 = round(2*precision*recall/(precision+recall),3)
+  ) %>%
+  group_by(recall) %>%
+  summarise(precision = max(precision),
+            .threshold = min(.threshold),
+            f1 = max(f1))
+
+scored_test %>%
+  ggplot(aes(.pred_1, fill=loan_status)) +
+  geom_histogram(bins=100) +
+  xlim(0, 1) +
+  geom_vline(aes(xintercept=0.1)) +
+  labs(title="xgb score distribution")
+```
+
+
+
+# Explaination for final model
+## explainer
+```{r}
+library(DALEXtra)
+
+xgb_explainer <- explain_tidymodels(
+  xgb_model_fit,
+  data = dplyr::select(train, -loan_status),
+  y = train$loan_status ,
+  verbose = FALSE
+)
+```
+## numeric Variable Funciton
+```{r}
+pdp_plotter <- function(variable){
+  pdp_age <- model_profile(
+  xgb_explainer,
+  variables = variable
+)
+  
+pdp_plot <- as_tibble(pdp_age$agr_profiles) %>%
+  mutate(`_label_` = str_remove(`_label_`, "workflow_")) %>%
+  ggplot(aes(`_x_`, `_yhat_`, color = `_label_`)) +
+  geom_line(size = 1.2, alpha = 0.8) +
+  labs(
+    x = variable,
+     y = " Average prediction Impact ",
+    color = NULL,
+    title = "Partial Dependence Profile Plot:",
+    subtitle = variable
+  )
+print(pdp_plot)
+}
+
+numeric_vars <- c("last_pymnt_d_yr","last_pymnt_amnt","last_credit_pull_d_yr","member_id","last_credit_pull_d_mth","term","last_pymnt_d_mth","total_rec_late_fee","installment","issue_d_mth")
+
+for (var in numeric_vars){
+  pdp_plotter(var)
+}
+
+
+```
+## Local Explainations
+```{r}
+model_features<-c(
+  "last_pymnt_d_yr","last_pymnt_amnt","last_credit_pull_d_yr","member_id","last_credit_pull_d_mth","term","last_pymnt_d_mth","total_rec_late_fee","installment","issue_d_mth",'id', 'loan_amnt', 'funded_amnt', 'funded_amnt_inv', 'int_rate', 'grade', 'sub_grade', 'emp_length', 'home_ownership', 'annual_inc', 'verification_status', 'pymnt_plan', 'desc', 'purpose', 'zip_code', 'dti', 'delinq_2yrs', 'fico_range_low', 'fico_range_high', 'inq_last_6mths', 'open_acc', 'pub_rec', 'revol_bal', 'revol_util', 'total_acc', 'out_prncp', 'out_prncp_inv', 'application_type', 'acc_now_delinq', 'delinq_amnt', 'pub_rec_bankruptcies', 'tax_liens', 'earliest_cr_line_mth', 'earliest_cr_line_yr', 'issue_d_yr', 'addr_state_freq','sentiment_desc','title_freq', 'issue_d', 'earliest_cr_line', 'last_pymnt_d', 'last_credit_pull_d')
+
+
+xgb_explainer <- explain_tidymodels(
+    xgb_final_fit,   # fitted workflow object 
+    data = train,    # original training data
+    y = train$loan_status, # predicted outcome 
+    label = "xgboost",
+    verbose = FALSE)
+
+
+
+explain_prediction <- function(record){
+  record = record %>% dplyr::select(all_of(model_features))
+  # run the explainer 
+  xgb_breakdown <- predict_parts(explainer = xgb_explainer, 
+                                 new_observation = record) %>% as_tibble()
+  prediction_prob <- predict(xgb_model_fit,
+        record,
+        type="prob") %>% pull()
+  # plot the explainer 
+  p1 <- xgb_breakdown %>%
+      filter(variable != "prediction")%>%
+    dplyr::select(-desc)%>%
+      mutate(contribution = round(contribution,3)) %>%
+    filter(contribution!=0)%>%
+      ggplot(aes(y=reorder(variable,position),x=contribution, fill=sign)) +
+      geom_col() + 
+      geom_text(aes(label=contribution), 
+                position=position_dodge(width=0.7),
+                vjust=0.5,)+
+        labs(title = "DALEX explainations",
+          subtitle = paste("predicted:",as.character(round(prediction_prob,3))),
+                          x="contribution",
+                          y="features")
+  print(p1)
+}
+
+top_10_tp <- scored_test %>%
+  filter(.pred_class == loan_status) %>%
+  slice_max(.pred_1,n=10)
+
+top_10_fp <- scored_test %>%
+  filter(.pred_class != loan_status) %>%
+   filter(loan_status == 0 ) %>%
+  slice_max(.pred_1,n=10)
+
+top_10_fn <- scored_test %>%
+  filter(.pred_class != loan_status ) %>%
+  filter(loan_status == 1 ) %>%
+  slice_max(.pred_1,n=10)
+
+# repeat for FP and FN 
+for (row in 1:nrow(top_10_tp)) {
+    s_record <- top_10_tp[row,]
+    explain_prediction(s_record)                    
+} 
+
+for (row in 1:nrow(top_10_fp)) {
+    s_record <- top_10_fp[row,]
+    explain_prediction(s_record)
+} 
+
+for (row in 1:nrow(top_10_fn)) {
+    s_record <- top_10_fn[row,]
+    explain_prediction(s_record)
+} 
+
+```
+
+
+# Anomaly Detection
+## Train IsolationForest
+```{r}
+bake_loan<-bake(loan_recipe%>%prep(),loan)
+iso_forest <- isolationForest$new(
+  sample_size = 256,
+  num_trees = 500,
+  max_depth = ceiling(log2(256)))
+
+
+iso_forest$fit(bake_loan)
+```
+## Pick average_depth
+```{r}
+pred_train <- iso_forest$predict(bake_loan)
+
+pred_train %>%
+  ggplot(aes(average_depth)) +
+  geom_histogram(bins=20) + 
+  geom_vline(xintercept = 7.2, linetype="dotted", 
+                color = "blue", size=1.5) + 
+  labs(title="Isolation Forest Average Tree Depth")
+
+pred_train %>%
+  ggplot(aes(anomaly_score)) +
+  geom_histogram(bins=20) + 
+  geom_vline(xintercept = 0.615, linetype="dotted", 
+                color = "blue", size=1.5) + 
+  labs(title="Isolation Forest Anomaly Score Above 0.615")
+
+
+```
+## Global Level Interpretation 
+```{r}
+train_pred <- bind_cols(iso_forest$predict(bake_loan),bake_loan) %>%
+  mutate(anomaly = as.factor(if_else(average_depth <= 7.2, "Anomaly","Normal")))
+
+train_pred %>%
+  arrange(average_depth) %>%
+  count(anomaly)
+
+```
+## Fit a Tree 
+```{r}
+fmla <- as.formula(paste("anomaly ~ ", paste(bake_loan %>% colnames(), collapse= "+")))
+
+outlier_tree <- decision_tree(min_n=2, tree_depth=3, cost_complexity = .01) %>%
+  set_mode("classification") %>%
+  set_engine("rpart") %>%
+  fit(fmla, data=train_pred)
+
+outlier_tree$fit
+```
+## Plot the Tree
+```{r}
+library(rpart.plot) # -- plotting decision trees 
+
+rpart.plot(outlier_tree$fit,clip.right.labs = FALSE, branch = .3, under = TRUE, roundint=FALSE, extra=3)
+
+```
+## Global Anomaly Rules 
+```{r}
+anomaly_rules <- rpart.rules(outlier_tree$fit,roundint=FALSE, extra = 4, cover = TRUE, clip.facs = TRUE) %>% clean_names() %>%
+  #filter(anomaly=="Anomaly") %>%
+  mutate(rule = "IF") 
+
+
+rule_cols <- anomaly_rules %>% dplyr::select(starts_with("x_")) %>% colnames()
+
+for (col in rule_cols){
+anomaly_rules <- anomaly_rules %>%
+    mutate(rule = paste(rule, !!as.name(col)))
+}
+
+anomaly_rules %>%
+  as.data.frame() %>%
+  filter(anomaly == "Anomaly") %>%
+  mutate(rule = paste(rule, " THEN ", anomaly )) %>%
+  mutate(rule = paste(rule," coverage ", cover)) %>%
+  dplyr::select( rule)
+
+anomaly_rules %>%
+  as.data.frame() %>%
+  filter(anomaly == "Normal") %>%
+  mutate(rule = paste(rule, " THEN ", anomaly )) %>%
+  mutate(rule = paste(rule," coverage ", cover)) %>%
+  dplyr::select( rule)
+```
+## Show anomaly
+```{r}
+
+pred_train <- bind_cols(iso_forest$predict(bake_loan),
+                        bake_loan)
+
+
+pred_train %>%
+  arrange(desc(anomaly_score) ) %>%
+  filter(average_depth <= 7.2)%>%
+  dplyr::select(id,average_depth,anomaly_score,inq_last_6mths,sentiment_desc,total_acc)
+```
+
+
+
+
+
+
+
+
+# kaggle
+```{r}
+kaggle <- read_csv("loan_holdout.csv") %>%
+  clean_names() 
+head(kaggle)
+```
+
+## Data Munging
+```{r}
+kaggle %>%
+  dplyr::select(-mths_since_last_record,-mths_since_last_delinq,-next_pymnt_d,-url,-emp_title)%>%
+  mutate(term = as.numeric(chartr('months','      ',term))) %>%
+  mutate(int_rate = as.numeric(chartr('%',' ',int_rate))) %>%
+  mutate(sub_grade = as.numeric(substr(sub_grade,2,3))) %>%
+  mutate(zip_code = as.numeric(chartr('xx','  ',zip_code))) %>%
+  mutate(revol_util = as.numeric(chartr('%',' ',revol_util))) %>%
+  mutate(earliest_cr_line_mth = match(tolower(substr(earliest_cr_line,1,3)), tolower(month.abb))) %>%
+  mutate(earliest_cr_line_yr = as.numeric(substr(earliest_cr_line,5,9))) %>%
+  mutate(issue_d_mth = match(tolower(substr(issue_d,1,3)), tolower(month.abb))) %>%
+  mutate(issue_d_yr = as.numeric(substr(issue_d,5,9))) %>%
+  mutate(last_pymnt_d_mth = match(tolower(substr(last_pymnt_d,1,3)), tolower(month.abb))) %>%
+  mutate(last_pymnt_d_yr = as.numeric(substr(last_pymnt_d,5,9))) %>%
+  mutate(last_credit_pull_d_mth = match(tolower(substr(last_credit_pull_d,1,3)), tolower(month.abb))) %>%
+  mutate(last_credit_pull_d_yr = as.numeric(substr(last_credit_pull_d,5,9))) %>%
+  dplyr::select(-issue_d,-earliest_cr_line,-last_pymnt_d,-last_credit_pull_d,
+                -collections_12_mths_ex_med,-policy_code,-chargeoff_within_12_mths)->kaggle
+
+kaggle <- kaggle %>%
+  left_join(addr_state_freq)%>%
+  dplyr::select(-addr_state) ->kaggle
+
+kaggle %>%
+  mutate_if(is.character,as_factor) %>%
+  mutate(desc=as.character(desc))->kaggle
+
+kaggle <- kaggle %>% 
+  left_join(sent_desc)
+
+kaggle <- kaggle %>%
+  left_join(title_freq)
+kaggle %>%
+  dplyr::select(-title) ->kaggle
+
+kaggle%>%
+  mutate(issue_d=issue_d_yr+issue_d_mth/12,
+         earliest_cr_line=earliest_cr_line_yr+earliest_cr_line_mth/12,
+         last_pymnt_d=last_pymnt_d_yr+last_pymnt_d_mth/12,
+         last_credit_pull_d=last_credit_pull_d_yr+last_credit_pull_d_mth/12)->kaggle
+
+```
+
+
+```{r}
+predict(xgb_final_fit, kaggle, type="prob") %>%
+  bind_cols(kaggle) %>%dplyr::select(id,.pred_1)%>%rename(loan_status=.pred_1)->kaggle_perdict
+
+write.csv(kaggle_perdict,'kaggle15.csv')
+```
+
