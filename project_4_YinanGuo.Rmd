@@ -1,0 +1,434 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(vip)
+library(parallel)
+library(doParallel)
+library(embed)
+library(textrecipes)
+library(parallel)  # - new 
+library(doParallel) # - new 
+library(xgboost)
+library(tidytext)
+library(glmnet)
+library(workflows)
+```
+
+# input data
+```{r}
+clunk <- read_csv("project_4_training-2.csv") %>%
+  clean_names() 
+```
+
+# skim
+```{r}
+clunk%>%skim()
+```
+
+# as factor
+```{r}
+clunk %>%
+  mutate(is_bad_buy=factor(is_bad_buy))%>%
+  mutate_if(is.character,as_factor) -> clunk
+
+```
+
+## variable transformation
+```{r}
+model_freq <- clunk %>%
+  group_by(model) %>%
+  summarise(model_freq = n()) 
+clunk <- clunk %>%
+  left_join(model_freq)%>%
+  dplyr::select(-model)
+
+trim_freq <- clunk %>%
+  group_by(trim) %>%
+  summarise(trim_freq = n()) 
+clunk <- clunk %>%
+  left_join(trim_freq)%>%
+  dplyr::select(-trim)
+
+sub_model_freq <- clunk %>%
+  group_by(sub_model) %>%
+  summarise(sub_model_freq = n()) 
+clunk <- clunk %>%
+  left_join(sub_model_freq)%>%
+  dplyr::select(-sub_model)
+
+quality_code_freq <- clunk %>%
+  group_by(quality_code) %>%
+  summarise(quality_code_freq = n()) 
+clunk <- clunk %>%
+  left_join(quality_code_freq)%>%
+  dplyr::select(-quality_code)
+
+make_freq <- clunk %>%
+  group_by(make) %>%
+  summarise(make_freq = n()) 
+clunk <- clunk %>%
+  left_join(make_freq)%>%
+  dplyr::select(-make)
+
+vnst_freq <- clunk %>%
+  group_by(vnst) %>%
+  summarise(vnst_freq = n()) 
+clunk <- clunk %>%
+  left_join(vnst_freq)%>%
+  dplyr::select(-vnst)
+
+color_freq <- clunk %>%
+  group_by(color) %>%
+  summarise(color_freq = n()) 
+clunk <- clunk %>%
+  left_join(color_freq)%>%
+  dplyr::select(-color)
+
+clunk %>%
+  mutate(purchday=as.numeric(Sys.Date()-purch_date))%>%
+  dplyr::select(-purch_date)->clunk
+```
+
+# train test split
+```{r}
+
+set.seed(123)
+
+train_test_split<- initial_split(clunk, prop = 0.7, strata = is_bad_buy)
+
+train <- training(train_test_split)
+test <- testing(train_test_split)
+
+
+train_cv_folds <- vfold_cv(train, v=5)
+```
+
+## using recipes to do term frequency encoding of text
+```{r}
+recipe <- recipe(is_bad_buy ~ ., 
+                      data = train) %>%
+  step_rm(id) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+  
+```
+
+# Random Forest
+
+## -- the tough part 
+```{r}
+
+# -- setup model spec w. tuning 
+rf_model <- rand_forest(
+    trees  = tune(),
+    min_n = tune(),
+   ) %>% 
+      set_engine("ranger", importance = "impurity") %>% 
+      set_mode("classification")
+
+# -- setup workflow 
+rf_workflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(rf_model) 
+
+
+# -- setup your tuning grid -- random force 
+tune_grid <- grid_random(trees(c(100,200)),
+                         min_n(),
+                          size = 5)
+print(tune_grid)
+
+# -- setup parallel process 
+all_cores <- detectCores(logical = TRUE)
+sprintf("# of Logical Cores: %d", all_cores)
+cl <- makeCluster(all_cores)
+registerDoParallel(cl)
+
+# -- train!! K times for each parameter -- 
+rf_tuning_results <- rf_workflow %>% 
+  tune_grid(
+    resamples = train_cv_folds,
+    grid = tune_grid,
+    control = control_resamples(save_pred = TRUE)
+    )
+
+rf_tuning_results
+
+```
+
+
+## Review Tuning Results 
+```{r}
+## -- results of tuning -- 
+
+rf_tuning_results %>% 
+  collect_metrics() %>%
+  mutate_if(is.numeric, round,3) %>% 
+  pivot_wider(names_from = .metric, values_from=c(mean, std_err))
+```
+
+## results 
+selecting "best" parameters
+```{r}
+rf_best <- rf_tuning_results %>%
+  select_best("roc_auc") 
+
+print(rf_best)
+```
+
+## refitting workflow with "best" parameters
+```{r}
+rf_final_wf <- rf_workflow %>% 
+  finalize_workflow(rf_best)
+
+print(rf_final_wf)
+
+rf_final_fit  <- rf_final_wf %>%
+  fit(data = train) 
+```
+
+## vip
+```{r}
+rf_final_fit %>% 
+  pull_workflow_fit() %>% 
+  vip(20)
+```
+## evaluate test and train
+```{r}
+options(yardstick.event_first = FALSE)
+predict(rf_final_fit, train, type="prob") %>%
+  bind_cols(predict(rf_final_fit, train, type="class")) %>%
+  bind_cols(train)  -> rf_train
+rf_train%>%
+  metrics(is_bad_buy, estimate = .pred_class, .pred_1)
+
+predict(rf_final_fit, test, type="prob") %>%
+  bind_cols(predict(rf_final_fit, test, type="class")) %>%
+  bind_cols(test) -> rf_test
+
+rf_test %>%
+  metrics(is_bad_buy, estimate = .pred_class, .pred_1)
+```
+
+
+
+
+# XGB model
+## tune grid
+```{r}
+xgb_model <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),       ## how deep of a tree, model complexity
+  min_n = tune(),            ## minimum number of observations 
+  learn_rate = tune()        ## step size
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_model
+
+# -- setup workflow 
+xgb_workflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(xgb_model) 
+
+
+# -- setup your tuning grid -- random force 
+tune_grid <- grid_random(trees(),
+                         tree_depth(),
+                          min_n(),
+                          learn_rate(),
+                          size = 5)
+print(tune_grid)
+```
+
+## Review Tuning Results 
+```{r}
+ xgb_tuning_results <- xgb_workflow %>% 
+   tune_grid(
+     resamples = train_cv_folds,
+     grid = tune_grid,
+     control = control_resamples(save_pred = TRUE)
+     )
+ 
+ xgb_tuning_results
+
+## -- results of tuning -- 
+ xgb_tuning_results %>% 
+   collect_metrics() %>%
+   mutate_if(is.numeric, round,3) %>% 
+   pivot_wider(names_from = .metric, values_from=c(mean, std_err))
+```
+
+## selecting "best" parameters 
+```{r}
+xgb_tuning_results %>%
+  show_best("roc_auc") %>%
+  print()
+
+xgb_best <- xgb_tuning_results %>%
+  select_best("roc_auc") 
+
+print(xgb_best)
+```
+
+## refitting workflow with "best" parameters
+```{r}
+
+xgb_final_wf <- xgb_workflow %>% 
+  finalize_workflow(xgb_best)
+
+print(xgb_final_wf)
+
+xgb_final_fit  <- xgb_final_wf %>%
+  fit(data = train) 
+```
+
+## score xgb model
+```{r}
+# model_name <- rf_workflow
+# -- training  
+  predict(xgb_final_fit , train, type="prob") %>%
+    bind_cols(predict(xgb_final_fit, train, type="class")) %>%
+    bind_cols(.,train)-> scored_xgb_train
+
+  # -- testing 
+  predict(xgb_final_fit , test, type="prob") %>%
+    bind_cols(predict(xgb_final_fit, test, type="class")) %>%
+    bind_cols(.,test) -> scored_xgb_test   
+
+  # -- AUC: Train and Test 
+scored_xgb_train %>% 
+    metrics(is_bad_buy, .pred_1, estimate = .pred_class) %>%
+    mutate(part="training") %>%
+    bind_rows( scored_xgb_test %>% 
+                 metrics(is_bad_buy, .pred_1, estimate = .pred_class) %>%
+                 mutate(part="testing") ) %>%
+    pivot_wider(names_from = .metric, values_from=.estimate)
+  
+  scored_xgb_train %>%
+    conf_mat(is_bad_buy, .pred_class) %>%
+    autoplot(type = "heatmap")
+  
+   scored_xgb_test %>%
+    conf_mat(is_bad_buy, .pred_class) %>%
+    autoplot(type = "heatmap")
+  
+  # -- ROC Charts 
+  scored_xgb_train %>%
+  mutate(model = "train") %>%
+  bind_rows(scored_xgb_test %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(is_bad_buy, .pred_1) %>%
+  autoplot() 
+  
+
+    # -- variable importance: top 10
+  xgb_final_fit %>%
+    pull_workflow_fit() %>%
+  vip(num_features = 10)
+```
+
+# Compare 2 models
+```{r}
+# ROC
+options(yardstick.event_first = FALSE)
+
+scored_xgb_test %>% 
+  mutate(part="XGBoost test") %>%
+  bind_rows( scored_xgb_train %>% 
+  mutate(part="XGBoost train") ,rf_test %>% 
+               mutate(part="Random Forest test") ,rf_train %>% 
+               mutate(part="Random Forest train") ) %>%
+ group_by(part) %>%
+ roc_curve(is_bad_buy, .pred_1) %>%
+  autoplot()
+
+# chart
+scored_xgb_train %>% 
+    metrics(is_bad_buy, .pred_1, estimate = .pred_class) %>%
+    mutate(part="xgb training") %>%
+    bind_rows( scored_xgb_test %>% 
+                 metrics(is_bad_buy, .pred_1, estimate = .pred_class) %>%
+                 mutate(part="xgb testing"),
+               rf_train %>% 
+    metrics(is_bad_buy, .pred_1, estimate = .pred_class) %>%
+    mutate(part="random forest training"),
+    rf_test %>% 
+    metrics(is_bad_buy, .pred_1, estimate = .pred_class) %>%
+    mutate(part="random forest testing")
+    ) %>%
+    pivot_wider(names_from = .metric, values_from=.estimate)
+```
+
+
+
+# holdout
+```{r}
+holdout <- read_csv("project_4_kaggle-2.csv") %>%
+  clean_names() 
+
+holdout %>%
+  mutate_if(is.character,as_factor)->holdout
+
+
+holdout <- holdout %>%
+  left_join(model_freq)%>%
+  dplyr::select(-model)%>%
+  left_join(trim_freq)%>%
+  dplyr::select(-trim)%>%
+  left_join(sub_model_freq)%>%
+  dplyr::select(-sub_model) %>%
+  left_join(quality_code_freq)%>%
+  dplyr::select(-quality_code)%>%
+  left_join(make_freq)%>%
+  dplyr::select(-make)%>%
+  left_join(vnst_freq)%>%
+  dplyr::select(-vnst)%>%
+  left_join(color_freq)%>%
+  dplyr::select(-color)
+  
+holdout %>%
+  mutate(purchday=as.numeric(Sys.Date()-purch_date))%>%
+  dplyr::select(-purch_date)->holdout
+
+```
+
+## predict
+```{r}
+
+kaggle4 <-
+predict(rf_final_fit, holdout, type = "prob") %>%
+  bind_cols(.,predict(rf_final_fit, holdout))%>%
+  bind_cols(., holdout) 
+
+kaggle4 <- kaggle4%>%
+  dplyr::select(id, .pred_1) %>%
+  rename(IsBadBuy = .pred_1)%>%
+  mutate(id=as.integer(id))
+
+kaggle7 <-
+predict(xgb_final_fit, holdout, type = "prob") %>%
+  bind_cols(.,predict(xgb_final_fit, holdout))%>%
+  bind_cols(., holdout) 
+
+kaggle7 <- kaggle7%>%
+  dplyr::select(id, .pred_1) %>%
+  rename(IsBadBuy = .pred_1)%>%
+  mutate(id=as.integer(id))
+write.csv(kaggle7,'kaggle11.csv')
+
+```
+
