@@ -1,0 +1,557 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(vip)
+library(parallel)
+library(doParallel)
+library(embed)
+library(textrecipes)
+library(parallel)  # - new 
+library(doParallel) # - new 
+library(xgboost)
+```
+
+# input data
+```{r}
+job <- read_csv("job_training.csv") %>%
+  clean_names() 
+```
+
+# skim
+```{r}
+job%>%skim()
+```
+
+# as factor
+```{r}
+job %>%
+  mutate(fraudulent = factor(fraudulent),
+         employment_type=factor(employment_type),
+         required_experience=factor(required_experience),
+         required_education=factor(required_education),
+         job_function=factor(job_function)) -> job
+```
+
+## variable transformation
+```{r}
+#department
+department_freq <- job %>%
+  group_by(department) %>%
+  summarise(department_freq = n()) 
+job <- job %>%
+  left_join(department_freq)
+#salary_range
+separate(data=job,col=salary_range,into=c("min","max"),sep="-")->job
+job%>%
+  mutate(min=as.numeric(min),
+         max=as.numeric(max))->job
+#industry
+industry_freq <- job %>%
+  group_by(industry) %>%
+  summarise(industry_freq = n()) 
+job <- job %>%
+  left_join(industry_freq)
+job<-job %>%
+  dplyr::select(-department)%>%
+  dplyr::select(-industry)
+#location
+separate(data=job,col=location,into=c("country","state","city"),sep=",")->job
+job<-job%>%mutate(country=factor(country))
+
+job%>%mutate(state=if_else(state==" ","NA",state))->job
+job$state[job$state=="NA"]<-NA
+state_freq_count  <- job %>%
+  count(state, sort=TRUE) %>%
+  dplyr::select(state, state_count = n)
+job <- job %>%
+  left_join(state_freq_count) %>%
+  dplyr::select(-state)
+
+city_freq_count  <- job %>%
+  count(city, sort=TRUE) %>%
+  dplyr::select(city, city_count = n)
+job <- job %>%
+  left_join(city_freq_count) %>%
+  dplyr::select(-city)
+
+```
+
+## Dealing with Text using Sentiment
+```{r}
+library(tidytext)
+afinn <- get_sentiments("afinn")
+
+sent_title <- job %>% 
+  unnest_tokens(word, title) %>% 
+  filter(!word %in% stop_words) %>% 
+  inner_join(afinn) %>% 
+  group_by(job_id) %>% 
+  summarise(sentiment_title = sum(value))
+
+job <- job %>% 
+  left_join(sent_title) 
+
+sent_company_profile <- job %>% 
+  unnest_tokens(word, company_profile) %>% 
+  filter(!word %in% stop_words) %>% 
+  inner_join(afinn) %>% 
+  group_by(job_id) %>% 
+  summarise(sentiment_company_profile = sum(value))
+
+job <- job %>% 
+  left_join(sent_company_profile) 
+
+sent_description <- job %>% 
+  unnest_tokens(word, description) %>% 
+  filter(!word %in% stop_words) %>% 
+  inner_join(afinn) %>% 
+  group_by(job_id) %>% 
+  summarise(sentiment_description = sum(value))
+
+job <- job %>% 
+  left_join(sent_description) 
+
+sent_requirements <- job %>% 
+  unnest_tokens(word, requirements) %>% 
+  filter(!word %in% stop_words) %>% 
+  inner_join(afinn) %>% 
+  group_by(job_id) %>% 
+  summarise(sentiment_requirements = sum(value))
+
+job <- job %>% 
+  left_join(sent_requirements) 
+
+sent_benefits <- job %>% 
+  unnest_tokens(word, benefits) %>% 
+  filter(!word %in% stop_words) %>% 
+  inner_join(afinn) %>% 
+  group_by(job_id) %>% 
+  summarise(sentiment_benefits = sum(value))
+
+job <- job %>% 
+  left_join(sent_benefits) 
+```
+
+# train test split
+```{r}
+
+set.seed(123)
+
+train_test_spit<- initial_split(job, prop = 0.7, strata = fraudulent)
+
+train <- training(train_test_spit)
+test  <- testing(train_test_spit)
+
+sprintf("Train PCT : %1.2f%%", nrow(train)/ nrow(job) * 100)
+sprintf("Test  PCT : %1.2f%%", nrow(test)/ nrow(job) * 100)
+
+train_cv_folds <- vfold_cv(train, v=5)
+```
+
+## using recipes to do term frequency encoding of text
+```{r}
+rf_recipe <- recipe(fraudulent ~ . , data = train) %>%
+  step_unknown(all_nominal(), -all_outcomes()) %>%
+  step_meanimpute(all_numeric())%>%
+  step_dummy(country, employment_type,required_experience,required_education,job_function) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  
+  step_tokenize(title,company_profile,description,requirements,benefits) %>%
+  step_tokenfilter(title, max_tokens = 5) %>%
+  step_tokenfilter(company_profile, description,requirements,benefits,max_tokens = 100) %>%
+  
+  #step_texthash(title, num_terms=10) %>%
+  #step_texthash(company_profile, description,requirements,benefits, num_terms=30) %>%
+  step_stopwords(title,company_profile,description,requirements,benefits) %>%
+  #step_woe(title,company_profile,description,requirements,benefits, outcome = vars(fraudulent) ) %>%
+  step_tfidf(title,company_profile,description,requirements,benefits) %>%
+
+  step_rm(job_id)
+  #step_rm(title,company_profile,description,requirements,benefits)
+  
+rf_recipe
+```
+
+# XGB model
+## tune grid
+```{r}
+xgb_model <- boost_tree(
+  trees = tune(), 
+  tree_depth = tune(),       ## how deep of a tree, model complexity
+  min_n = tune(),            ## minimum number of observations 
+  learn_rate = tune()        ## step size
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_model
+
+# -- setup workflow 
+xgb_workflow <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(xgb_model) 
+
+# -- setup your tuning grid -- brute force 
+tune_grid <- grid_regular(tree_depth(),
+                          min_n(),
+                          learn_rate(),
+                          levels = 5)
+
+print(tune_grid)
+
+# -- setup your tuning grid -- random force 
+tune_grid <- grid_random(trees(), 
+                         tree_depth(),
+                          min_n(),
+                          learn_rate(),
+                          size = 5)
+print(tune_grid)
+```
+
+## Review Tuning Results 
+```{r}
+ xgb_tuning_results <- xgb_workflow %>% 
+   tune_grid(
+     resamples = train_cv_folds,
+     grid = tune_grid,
+     control = control_resamples(save_pred = TRUE)
+     )
+ 
+ xgb_tuning_results
+
+## -- results of tuning -- 
+ xgb_tuning_results %>% 
+   collect_metrics() %>%
+   mutate_if(is.numeric, round,3) %>% 
+   pivot_wider(names_from = .metric, values_from=c(mean, std_err))
+```
+
+## Visualize impact 
+```{r}
+## - visualize 
+xgb_tuning_results %>%
+  collect_metrics() %>%
+  mutate_if(is.numeric, round,3) %>%
+  ggplot(aes(trees, mean, )) +
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) 
+
+xgb_tuning_results %>%
+  collect_metrics()  %>%
+  mutate_if(is.numeric, round,3) %>%
+  ggplot(aes(min_n, mean, )) +
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) 
+
+xgb_tuning_results %>%
+  collect_metrics()  %>%
+  mutate_if(is.numeric, round,3) %>%
+  ggplot(aes(tree_depth, mean, )) +
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) 
+
+xgb_tuning_results %>%
+  collect_metrics()  %>%
+  mutate_if(is.numeric, round,3) %>%
+  ggplot(aes(learn_rate, mean, )) +
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) 
+
+```
+
+## selecting "best" parameters 
+```{r}
+xgb_tuning_results %>%
+  show_best("roc_auc") %>%
+  print()
+
+xgb_best <- xgb_tuning_results %>%
+  select_best("roc_auc") 
+
+print(xgb_best)
+```
+
+## refitting workflow with "best" parameters
+```{r}
+library(glmnet)
+library(workflows)
+xgb_final_wf <- xgb_workflow %>% 
+  finalize_workflow(xgb_best)
+
+print(xgb_final_wf)
+
+xgb_final_fit  <- xgb_final_wf %>%
+  fit(data = train) 
+```
+
+## score xgb model
+```{r}
+# model_name <- rf_workflow
+# -- training  
+  predict(xgb_final_fit , train, type="prob") %>%
+    bind_cols(predict(xgb_final_fit, train, type="class")) %>%
+    bind_cols(.,train)-> scored_xgb_train 
+
+  # -- testing 
+  predict(xgb_final_fit , test, type="prob") %>%
+    bind_cols(predict(xgb_final_fit, test, type="class")) %>%
+    bind_cols(.,test) -> scored_xgb_test   
+
+  # -- AUC: Train and Test 
+scored_xgb_train %>% 
+    metrics(fraudulent, .pred_1, estimate = .pred_class) %>%
+    mutate(part="training") %>%
+    bind_rows( scored_xgb_test %>% 
+                 metrics(fraudulent, .pred_1, estimate = .pred_class) %>%
+                 mutate(part="testing") ) %>%
+    filter(.metric %in% c('accuracy','roc_auc')) %>%
+    pivot_wider(names_from = .metric, values_from=.estimate)
+  
+  scored_xgb_train %>%
+    conf_mat(fraudulent, .pred_class) %>%
+    autoplot(type = "heatmap")
+  
+   scored_xgb_test %>%
+    conf_mat(fraudulent, .pred_class) %>%
+    autoplot(type = "heatmap")
+  
+  # -- ROC Charts 
+  scored_xgb_train %>%
+  mutate(model = "train") %>%
+  bind_rows(scored_xgb_test %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(fraudulent, .pred_1) %>%
+  autoplot() 
+  
+  scored_xgb_test  %>%
+  roc_curve(fraudulent, .pred_1) %>%
+  mutate(fpr = round((1 - specificity),2),
+         tpr = round(sensitivity,3),
+         score_threshold =  1- round(.threshold,3)) %>%
+  group_by(fpr) %>%
+  summarise(score_threshold = max(score_threshold),
+            tpr = max(tpr))%>%
+  ungroup() %>%
+  mutate(precision = tpr/(tpr + fpr)) %>%
+  select(fpr, tpr, precision, score_threshold) %>%
+  filter(fpr <= 0.1)
+
+    # -- variable importance: top 10
+  xgb_final_fit %>%
+    pull_workflow_fit() %>%
+  vip(num_features = 10)
+```
+
+## ROC
+```{r}
+options(yardstick.event_first = FALSE)
+
+scored_xgb_train %>% 
+  mutate(part="training") %>%
+  bind_rows( scored_xgb_test %>% 
+               mutate(part="testing") ) %>%
+ group_by(part) %>%
+ roc_curve(fraudulent, .pred_1) %>%
+  autoplot()
+
+```
+
+
+# handy model
+```{r}
+xgb_model <- boost_tree(
+  trees = 1237, 
+  tree_depth = 7,       ## how deep of a tree, model complexity
+  min_n = 16,            ## minimum number of observations 
+  learn_rate = 0.0139456        ## step size
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+
+# -- setup workflow 
+xgb_workflow <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(xgb_model) 
+
+xgb_fit  <- xgb_workflow %>%
+  fit(data = train) 
+
+options(yardstick.event_first = FALSE)
+predict(xgb_fit, train, type="prob") %>%
+  bind_cols(predict(xgb_fit, train, type="class")) %>%
+  bind_cols(train)  -> xgb_train
+xgb_train%>%
+  metrics(fraudulent, estimate = .pred_class, .pred_1)
+
+predict(xgb_fit, test, type="prob") %>%
+  bind_cols(predict(xgb_fit, test, type="class")) %>%
+  bind_cols(test) -> xgb_test
+
+xgb_test %>%
+  metrics(fraudulent, estimate = .pred_class, .pred_1)
+```
+
+# Random Forest
+
+# -- the tough part 
+```{r}
+
+# -- setup model spec w. tuning 
+rf_model <- rand_forest(
+    trees  = tune(),
+    min_n = tune(),
+   ) %>% 
+      set_engine("ranger", importance = "impurity") %>% 
+      set_mode("regression")
+
+# -- setup workflow 
+rf_workflow <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(rf_model) 
+
+
+# -- setup your tuning grid -- random force 
+tune_grid1 <- grid_random(trees(c(100,200)),
+                         min_n(),
+                          size = 5)
+print(tune_grid1)
+
+# -- setup parallel process 
+all_cores <- detectCores(logical = TRUE)
+sprintf("# of Logical Cores: %d", all_cores)
+cl <- makeCluster(all_cores)
+registerDoParallel(cl)
+
+# -- train!! K times for each parameter -- 
+rf_tuning_results <- rf_workflow %>% 
+  tune_grid(
+    resamples = train_cv_folds,
+    grid = tune_grid1,
+    control = control_resamples(save_pred = TRUE)
+    )
+
+rf_tuning_results
+
+```
+
+
+## holdout
+```{r}
+holdout <- read_csv("job_holdout.csv") %>%
+  clean_names() 
+
+holdout %>%
+  mutate(
+         employment_type=factor(employment_type),
+         required_experience=factor(required_experience),
+         required_education=factor(required_education),
+         job_function=factor(job_function)) -> holdout
+
+
+holdout <- holdout %>%
+  left_join(department_freq)
+#salary_range
+separate(data=holdout,col=salary_range,into=c("min","max"),sep="-")->holdout
+holdout%>%
+  mutate(min=as.numeric(min),
+         max=as.numeric(max))->holdout
+
+holdout <- holdout %>%
+  left_join(industry_freq)
+holdout<-holdout %>%
+  dplyr::select(-department)%>%
+  dplyr::select(-industry)
+#location
+separate(data=holdout,col=location,into=c("country","state","city"),sep=",")->holdout
+holdout<-holdout%>%mutate(country=factor(country))
+
+holdout%>%mutate(state=if_else(state==" ","NA",state))->holdout
+holdout$state[job$state=="NA"]<-NA
+
+holdout <- holdout %>%
+  left_join(state_freq_count) %>%
+  dplyr::select(-state)
+
+holdout <- holdout %>%
+  left_join(city_freq_count) %>%
+  dplyr::select(-city)
+
+sent_title <- holdout %>% 
+  unnest_tokens(word, title) %>% 
+  filter(!word %in% stop_words) %>% 
+  inner_join(afinn) %>% 
+  group_by(job_id) %>% 
+  summarise(sentiment_title = sum(value))
+
+holdout <- holdout %>% 
+  left_join(sent_title) 
+
+sent_company_profile <- holdout %>% 
+  unnest_tokens(word, company_profile) %>% 
+  filter(!word %in% stop_words) %>% 
+  inner_join(afinn) %>% 
+  group_by(job_id) %>% 
+  summarise(sentiment_company_profile = sum(value))
+
+holdout <- holdout %>% 
+  left_join(sent_company_profile) 
+
+sent_description <- holdout %>% 
+  unnest_tokens(word, description) %>% 
+  filter(!word %in% stop_words) %>% 
+  inner_join(afinn) %>% 
+  group_by(job_id) %>% 
+  summarise(sentiment_description = sum(value))
+
+holdout <- holdout %>% 
+  left_join(sent_description) 
+
+sent_requirements <- holdout %>% 
+  unnest_tokens(word, requirements) %>% 
+  filter(!word %in% stop_words) %>% 
+  inner_join(afinn) %>% 
+  group_by(job_id) %>% 
+  summarise(sentiment_requirements = sum(value))
+
+holdout <- holdout %>% 
+  left_join(sent_requirements) 
+
+sent_benefits <- holdout %>% 
+  unnest_tokens(word, benefits) %>% 
+  filter(!word %in% stop_words) %>% 
+  inner_join(afinn) %>% 
+  group_by(job_id) %>% 
+  summarise(sentiment_benefits = sum(value))
+
+holdout <- holdout %>% 
+  left_join(sent_benefits) 
+```
+
+## predict
+```{r}
+kaggle <-
+predict(xgb_fit, holdout, type = "prob") %>%
+  bind_cols(.,predict(xgb_fit, holdout))%>%
+  bind_cols(., holdout) 
+
+kaggle <- kaggle%>%
+  dplyr::select(job_id, .pred_1) %>%
+  rename(fraudulent = .pred_1)
+
+write.csv(kaggle,'kaggle1.csv')
+```
+
